@@ -1,0 +1,8 @@
+build/
+mavlink_cache/
+*.o
+*.obj
+*.elf
+*.px4
+__pycache__/
+*.pyc

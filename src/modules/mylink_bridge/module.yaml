@@ -1,0 +1,6 @@
+module_name: MyLink Bridge
+serial_config:
+  - command: mylink_bridge start -d ${SERIAL_DEV} -b p:${BAUD_PARAM}
+    port_config_param:
+      name: MLB_CONFIG
+      group: MyLink Bridge
