@@ -42,10 +42,13 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/Publication.hpp>
 #include <uORB/topics/actuator_motors.h>
+#include <uORB/topics/battery_status.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_command.h>
+#include <uORB/topics/vehicle_command_ack.h>
 #include <uORB/topics/vehicle_control_mode.h>
+#include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
 
 #include <mavlink.h>
@@ -73,6 +76,16 @@ private:
 		Active
 	};
 
+	enum class DropReason : uint8_t {
+		GateClosed,
+		ForbiddenMessage,
+		ForbiddenCommand,
+		UnsupportedMessage,
+		UnsupportedCommand,
+		InvalidTarget,
+		InvalidPayload
+	};
+
 	enum EventFlag : uint32_t {
 		EventNone = 0,
 		EventTakeoff = 1u << 0,
@@ -85,6 +98,14 @@ private:
 		EventMotorThrottle = 1u << 7
 	};
 
+	enum class V4ActionState : uint8_t {
+		Hold,
+		Takeoff,
+		HorizontalMove,
+		VerticalMove,
+		Landing
+	};
+
 	void Run() override;
 	void readSerial();
 	void handleMavlinkMessage(const mavlink_message_t &message);
@@ -94,18 +115,43 @@ private:
 	bool cacheableMessage(const mavlink_message_t &message) const;
 	void cacheMessage(const mavlink_message_t &message);
 	void handlePing(const mavlink_message_t &message);
-	void handleCommandLong(const mavlink_message_t &message);
+	void handleHeartbeat(const mavlink_message_t &message);
+	void handleCommandLong(const mavlink_message_t &message, GateState state);
+	void handleV4UserCommand(const mavlink_message_t &message, GateState state,
+				 const mavlink_command_long_t &command);
 	void handleMotorTestCommand(const mavlink_message_t &message,
 				    const mavlink_command_long_t &command);
 	void handleOffboardModeCommand(const mavlink_message_t &message,
 				       const mavlink_command_long_t &command);
-	void handleCommandInt(const mavlink_message_t &message);
+	void handleLandCommand(const mavlink_message_t &message,
+			       const mavlink_command_long_t &command);
+	void handleCommandInt(const mavlink_message_t &message, GateState state);
 	void handleSetPositionTargetLocalNed(const mavlink_message_t &message, GateState state);
 	bool decodeLocalNedSetpoint(const mavlink_message_t &message,
 				    trajectory_setpoint_s &setpoint,
 				    offboard_control_mode_s &control_mode);
+	void publishVehicleCommand(const mavlink_message_t &message,
+				   const mavlink_command_long_t &command,
+				   uint16_t vehicle_command);
+	void forwardCommandAcks();
+	void updateTelemetry();
+	void updateV4Setpoint(GateState state);
+	void captureV4Hold(const vehicle_local_position_s &position, bool keep_heading);
+	void cancelV4ToHold(const vehicle_local_position_s &position, bool count_heading_abort,
+			   bool count_heading_reset);
+	bool v4HeadingValid(const vehicle_local_position_s &position) const;
+	bool v4Busy() const;
+	static float wrapPi(float angle);
+	void sendHeartbeat();
+	void sendLocalPositionNed();
+	void sendBatteryStatus();
 
 	GateState gateState(vehicle_status_s *status = nullptr);
+	static const char *gateStateName(GateState state);
+	static const char *dropReasonName(DropReason reason);
+	static const char *messageName(uint32_t message_id);
+	void updateGateStateLog(GateState state, const vehicle_status_s &status);
+	void recordDrop(const mavlink_message_t &message, GateState state, DropReason reason, uint16_t command = 0);
 	bool targetOk(uint8_t target_system, uint8_t target_component);
 	bool commandSupported(uint16_t command) const;
 	uint32_t eventFlagForCommand(const mavlink_command_long_t &command) const;
@@ -120,6 +166,9 @@ private:
 
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
+	uORB::Subscription _vehicle_command_ack_sub{ORB_ID(vehicle_command_ack)};
+	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
+	uORB::Subscription _battery_status_sub{ORB_ID(battery_status)};
 	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
@@ -152,8 +201,24 @@ private:
 	uint32_t _direct_motor_setpoints_published{0};
 	uint32_t _tx_frames{0};
 	uint32_t _tx_bytes{0};
+	uint32_t _command_acks_forwarded{0};
+	uint32_t _heartbeats_sent{0};
+	uint32_t _local_positions_sent{0};
+	uint32_t _battery_status_sent{0};
 	uint32_t _rx_errors{0};
 	uint32_t _tx_errors{0};
+	uint32_t _v4_rx_command{0};
+	uint32_t _v4_ack_sent{0};
+	uint32_t _v4_accepted{0};
+	uint32_t _v4_rejected{0};
+	uint32_t _v4_busy_rejected{0};
+	uint32_t _v4_takeoff_count{0};
+	uint32_t _v4_move_count{0};
+	uint32_t _v4_hold_count{0};
+	uint32_t _v4_land_count{0};
+	uint32_t _v4_heading_invalid_reject{0};
+	uint32_t _v4_heading_abort{0};
+	uint32_t _v4_heading_reset_abort{0};
 	int _last_rx_errno{0};
 	int _last_tx_errno{0};
 
@@ -171,4 +236,28 @@ private:
 	float _motor_throttle_percent{0.f};
 	hrt_abstime _motor_test_deadline{0};
 	hrt_abstime _motor_stop_deadline{0};
+	GateState _last_gate_state{GateState::Closed};
+	GateState _last_drop_state{GateState::Closed};
+	DropReason _last_drop_reason{DropReason::UnsupportedMessage};
+	bool _gate_state_initialized{false};
+	uint32_t _last_drop_message_id{0};
+	uint16_t _last_drop_command{0};
+	uint32_t _suppressed_drop_logs{0};
+	hrt_abstime _last_drop_timestamp{0};
+	hrt_abstime _last_drop_log_timestamp{0};
+	hrt_abstime _last_heartbeat_tx{0};
+	hrt_abstime _last_local_position_tx{0};
+	hrt_abstime _last_battery_status_tx{0};
+	uint8_t _peer_system_id{0};
+	uint8_t _peer_component_id{0};
+
+	V4ActionState _v4_action_state{V4ActionState::Hold};
+	bool _v4_initialized{false};
+	float _v4_target_position[3]{};
+	float _v4_command_position[3]{};
+	float _v4_command_velocity[3]{};
+	float _v4_yaw_ref{NAN};
+	uint8_t _v4_heading_reset_ref{0};
+	hrt_abstime _v4_bad_yaw_since{0};
+	hrt_abstime _v4_last_setpoint{0};
 };

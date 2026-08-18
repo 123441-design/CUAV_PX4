@@ -4,8 +4,8 @@
 binary MAVLink 1/2 byte stream with the generated PX4 MAVLink C library. It
 does not accept newline-delimited text commands.
 
-On CUAV V6X this firmware assigns TELEM1 (`/dev/ttyS6`) to the bridge at
-115200 baud and disables the MAVLink telemetry instance on TELEM1. USB MAVLink
+On CUAV V6X this firmware assigns TELEM2 (`/dev/ttyS4`) to the bridge at
+115200 baud and disables the MAVLink telemetry instance on TELEM2. USB MAVLink
 remains available for QGC.
 
 ## Receive gate and event flags

@@ -14,11 +14,11 @@ param set-default MAV_2_UDP_PRT 14550
 
 param set-default USB_MAV_MODE 5
 
-# Dedicated MyLink MAVLink decoder on TELEM1. USB MAVLink remains available
+# Dedicated MyLink MAVLink decoder on TELEM2. USB MAVLink remains available
 # for QGC, arming, mode selection and manual takeover.
 param set-default MAV_0_CONFIG 0
-param set-default MLB_CONFIG 101
-param set-default SER_TEL1_BAUD 115200
+param set-default MLB_CONFIG 102
+param set-default SER_TEL2_BAUD 115200
 
 safety_button start
 
