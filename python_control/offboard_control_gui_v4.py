@@ -23,6 +23,8 @@ DEFAULT_UDP_PORT = 14540
 DEFAULT_AMOUNT_M = 0.20
 DEFAULT_TAKEOFF_M = 1.00
 DEFAULT_HORIZONTAL_SPEED_M_S = 0.20
+KEEPALIVE_INTERVAL_S = 0.10
+HEARTBEAT_INTERVAL_S = 1.00
 MAV_CMD_USER_1 = int(mavlink2.MAV_CMD_USER_1)
 
 ACTION_TAKEOFF = 1
@@ -100,6 +102,8 @@ class MavlinkCommandClient:
         self._pending_lock = threading.Lock()
         self._pending_by_command: dict[int, PendingCommand] = {}
         self._receive_thread: threading.Thread | None = None
+        self._transmit_thread: threading.Thread | None = None
+        self._ping_sequence = 0
         self.target_system = 1
         self.target_component = 1
 
@@ -125,6 +129,8 @@ class MavlinkCommandClient:
         self.target_component = int(connection.target_component or 1)
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
+        self._transmit_thread = threading.Thread(target=self._transmit_loop, daemon=True)
+        self._transmit_thread.start()
         self.on_state(True)
 
     def disconnect(self) -> None:
@@ -133,6 +139,10 @@ class MavlinkCommandClient:
         if thread is not None:
             thread.join(timeout=1.0)
         self._receive_thread = None
+        transmit_thread = self._transmit_thread
+        if transmit_thread is not None:
+            transmit_thread.join(timeout=1.0)
+        self._transmit_thread = None
         connection = self._connection
         self._connection = None
         if connection is not None:
@@ -239,6 +249,40 @@ class MavlinkCommandClient:
                 f"RX {pending.action_name} ACK={ACK_NAMES.get(result, str(result))} "
                 f"latency={latency_ms:.0f}ms"
             )
+
+    def _transmit_loop(self) -> None:
+        next_heartbeat = 0.0
+        next_keepalive = 0.0
+        while not self._stop.is_set():
+            connection = self._connection
+            if connection is None:
+                return
+            now = time.monotonic()
+            try:
+                with self._tx_lock:
+                    if now >= next_heartbeat:
+                        connection.mav.heartbeat_send(
+                            mavlink2.MAV_TYPE_GCS,
+                            mavlink2.MAV_AUTOPILOT_INVALID,
+                            0,
+                            0,
+                            mavlink2.MAV_STATE_ACTIVE,
+                        )
+                        next_heartbeat = now + HEARTBEAT_INTERVAL_S
+                    if now >= next_keepalive:
+                        connection.mav.ping_send(
+                            time.time_ns() // 1000,
+                            self._ping_sequence,
+                            0,
+                            0,
+                        )
+                        self._ping_sequence = (self._ping_sequence + 1) & 0xFFFFFFFF
+                        next_keepalive = now + KEEPALIVE_INTERVAL_S
+            except Exception as error:
+                self.event_log.write(f"TX_KEEPALIVE_ERROR {error}")
+                next_heartbeat = now + HEARTBEAT_INTERVAL_S
+                next_keepalive = now + KEEPALIVE_INTERVAL_S
+            self._stop.wait(0.02)
 
 
 class OffboardControlGuiV4(tk.Tk):

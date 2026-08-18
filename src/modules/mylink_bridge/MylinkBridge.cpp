@@ -38,8 +38,6 @@
 #include <px4_platform_common/cli.h>
 #include <px4_platform_common/getopt.h>
 
-#include <commander/px4_custom_mode.h>
-
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
@@ -58,78 +56,6 @@ constexpr float kMotorTestMaximumTimeoutSeconds = 3.f;
 constexpr uint8_t kMotorTestThrottlePercent = 0;
 constexpr int kDirectMotorCount = 4;
 constexpr hrt_abstime kDirectMotorStopHold = 100_ms;
-constexpr hrt_abstime kDropLogInterval = 1_s;
-constexpr hrt_abstime kHeartbeatInterval = 1_s;
-constexpr hrt_abstime kLocalPositionInterval = 200_ms;
-constexpr hrt_abstime kBatteryStatusInterval = 1_s;
-constexpr hrt_abstime kV4SetpointInterval = 50_ms;
-constexpr float kV4MaxHorizontalStep = 0.50f;
-constexpr float kV4MaxHorizontalSpeed = 0.20f;
-constexpr float kV4MaxAcceleration = 0.40f;
-constexpr float kV4PositionTolerance = 0.04f;
-constexpr float kV4VelocityTolerance = 0.08f;
-constexpr float kV4YawAbortRadians = 0.3490658504f;
-constexpr hrt_abstime kV4YawAbortTime = 500_ms;
-constexpr uint8_t kV4ActionTakeoff = 1;
-constexpr uint8_t kV4ActionUp = 2;
-constexpr uint8_t kV4ActionDown = 3;
-constexpr uint8_t kV4ActionForward = 4;
-constexpr uint8_t kV4ActionBack = 5;
-constexpr uint8_t kV4ActionLeft = 6;
-constexpr uint8_t kV4ActionRight = 7;
-constexpr uint8_t kV4ActionHold = 8;
-
-uint32_t customMode(uint8_t nav_state)
-{
-	px4_custom_mode mode{};
-
-	switch (nav_state) {
-	case vehicle_status_s::NAVIGATION_STATE_MANUAL:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_MANUAL;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_ALTCTL:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_ALTCTL;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_POSCTL:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_POSCTL;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_OFFBOARD:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_OFFBOARD;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_STAB:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_STABILIZED;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_ACRO:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_ACRO;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_AUTO;
-		mode.sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_TAKEOFF;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_LAND:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_AUTO;
-		mode.sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_LAND;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_RTL:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_AUTO;
-		mode.sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_RTL;
-		break;
-
-	default:
-		mode.main_mode = PX4_CUSTOM_MAIN_MODE_AUTO;
-		break;
-	}
-
-	return mode.data;
-}
 }
 
 ModuleBase::Descriptor MylinkBridge::desc{task_spawn, custom_command, print_usage};
@@ -176,135 +102,6 @@ MylinkBridge::GateState MylinkBridge::gateState(vehicle_status_s *status_out)
 	       : GateState::CacheOnly;
 }
 
-const char *MylinkBridge::gateStateName(GateState state)
-{
-	switch (state) {
-	case GateState::Closed:
-		return "CLOSED";
-
-	case GateState::CacheOnly:
-		return "CACHE_ONLY";
-
-	case GateState::Active:
-		return "ACTIVE";
-	}
-
-	return "UNKNOWN";
-}
-
-const char *MylinkBridge::dropReasonName(DropReason reason)
-{
-	switch (reason) {
-	case DropReason::GateClosed:
-		return "gate_closed";
-
-	case DropReason::ForbiddenMessage:
-		return "forbidden_message";
-
-	case DropReason::ForbiddenCommand:
-		return "forbidden_command";
-
-	case DropReason::UnsupportedMessage:
-		return "unsupported_message";
-
-	case DropReason::UnsupportedCommand:
-		return "unsupported_command";
-
-	case DropReason::InvalidTarget:
-		return "invalid_target";
-
-	case DropReason::InvalidPayload:
-		return "invalid_payload";
-	}
-
-	return "unknown";
-}
-
-const char *MylinkBridge::messageName(uint32_t message_id)
-{
-	switch (message_id) {
-	case MAVLINK_MSG_ID_HEARTBEAT:
-		return "HEARTBEAT";
-
-	case MAVLINK_MSG_ID_PING:
-		return "PING";
-
-	case MAVLINK_MSG_ID_COMMAND_LONG:
-		return "COMMAND_LONG";
-
-	case MAVLINK_MSG_ID_COMMAND_INT:
-		return "COMMAND_INT";
-
-	case MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED:
-		return "SET_POSITION_TARGET_LOCAL_NED";
-
-	case MAVLINK_MSG_ID_MANUAL_CONTROL:
-		return "MANUAL_CONTROL";
-
-	case MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE:
-		return "RC_CHANNELS_OVERRIDE";
-
-	default:
-		return "UNKNOWN";
-	}
-}
-
-void MylinkBridge::updateGateStateLog(GateState state, const vehicle_status_s &status)
-{
-	const bool armed = status.timestamp != 0
-			   && status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
-
-	if (!_gate_state_initialized) {
-		PX4_INFO("gate initial=%s armed=%s nav_state=%u", gateStateName(state), armed ? "yes" : "no", status.nav_state);
-		_last_gate_state = state;
-		_gate_state_initialized = true;
-		return;
-	}
-
-	if (state != _last_gate_state) {
-		PX4_INFO("gate %s -> %s armed=%s nav_state=%u", gateStateName(_last_gate_state), gateStateName(state),
-			 armed ? "yes" : "no", status.nav_state);
-		_last_gate_state = state;
-	}
-}
-
-void MylinkBridge::recordDrop(const mavlink_message_t &message, GateState state, DropReason reason, uint16_t command)
-{
-	const hrt_abstime now = hrt_absolute_time();
-	const bool changed = message.msgid != _last_drop_message_id
-			     || command != _last_drop_command
-			     || state != _last_drop_state
-			     || reason != _last_drop_reason;
-
-	_gate_dropped_frames++;
-
-	_last_drop_message_id = message.msgid;
-	_last_drop_command = command;
-	_last_drop_state = state;
-	_last_drop_reason = reason;
-	_last_drop_timestamp = now;
-
-	if (changed || _last_drop_log_timestamp == 0 || now - _last_drop_log_timestamp >= kDropLogInterval) {
-		if (command != 0) {
-			PX4_WARN("drop gate=%s msg=%s(%u) cmd=%u reason=%s repeated=%" PRIu32,
-				 gateStateName(state), messageName(message.msgid), static_cast<unsigned>(message.msgid),
-				 static_cast<unsigned>(command),
-				 dropReasonName(reason), _suppressed_drop_logs);
-
-		} else {
-			PX4_WARN("drop gate=%s msg=%s(%u) reason=%s repeated=%" PRIu32,
-				 gateStateName(state), messageName(message.msgid), static_cast<unsigned>(message.msgid), dropReasonName(reason),
-				 _suppressed_drop_logs);
-		}
-
-		_last_drop_log_timestamp = now;
-		_suppressed_drop_logs = 0;
-
-	} else {
-		_suppressed_drop_logs++;
-	}
-}
-
 bool MylinkBridge::targetOk(uint8_t target_system, uint8_t target_component)
 {
 	vehicle_status_s status{};
@@ -318,20 +115,7 @@ bool MylinkBridge::targetOk(uint8_t target_system, uint8_t target_component)
 
 bool MylinkBridge::commandSupported(uint16_t command) const
 {
-	switch (command) {
-	case MAV_CMD_USER_1:
-	case MAV_CMD_NAV_RETURN_TO_LAUNCH:
-	case MAV_CMD_NAV_LAND:
-	case MAV_CMD_NAV_TAKEOFF:
-	case MAV_CMD_DO_CHANGE_SPEED:
-	case MAV_CMD_DO_PAUSE_CONTINUE:
-	case MAV_CMD_MISSION_START:
-	case MAV_CMD_DO_MOTOR_TEST:
-		return true;
-
-	default:
-		return false;
-	}
+	return command == MAV_CMD_NAV_LAND;
 }
 
 uint32_t MylinkBridge::eventFlagForCommand(const mavlink_command_long_t &command) const
@@ -397,15 +181,13 @@ void MylinkBridge::sendCommandAck(uint16_t command, uint8_t result, uint8_t prog
 					    command, result, progress, result_param2,
 					    target_system, target_component);
 	sendMavlinkMessage(response);
-	if (command == MAV_CMD_USER_1) {
-		_v4_ack_sent++;
-	}
 }
 
 void MylinkBridge::handlePing(const mavlink_message_t &message)
 {
 	mavlink_ping_t ping{};
 	mavlink_msg_ping_decode(&message, &ping);
+	_handled_messages++;
 
 	// target 0/0 is the standard MAVLink ping request. A targeted PING is a
 	// response and must not be echoed again.
@@ -422,13 +204,11 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	mavlink_msg_ping_pack_status(system_id, component_id, &_tx_status, &response,
 				     ping.time_usec, ping.seq, message.sysid, message.compid);
 	sendMavlinkMessage(response);
-	_handled_messages++;
 }
 
 void MylinkBridge::handleHeartbeat(const mavlink_message_t &message)
 {
-	_peer_system_id = message.sysid;
-	_peer_component_id = message.compid;
+	(void)message;
 	_handled_messages++;
 }
 
@@ -452,245 +232,39 @@ void MylinkBridge::publishVehicleCommand(const mavlink_message_t &message,
 	vehicle_command.confirmation = command.confirmation;
 	vehicle_command.from_external = true;
 	_vehicle_command_pub.publish(vehicle_command);
-	_peer_system_id = message.sysid;
-	_peer_component_id = message.compid;
-	_handled_messages++;
 }
 
-float MylinkBridge::wrapPi(float angle)
-{
-	while (angle > 3.14159265359f) {
-		angle -= 6.28318530718f;
-	}
-
-	while (angle < -3.14159265359f) {
-		angle += 6.28318530718f;
-	}
-
-	return angle;
-}
-
-bool MylinkBridge::v4HeadingValid(const vehicle_local_position_s &position) const
-{
-	return position.heading_good_for_control && PX4_ISFINITE(position.heading);
-}
-
-bool MylinkBridge::v4Busy() const
-{
-	return _v4_action_state != V4ActionState::Hold && _v4_action_state != V4ActionState::Landing;
-}
-
-void MylinkBridge::captureV4Hold(const vehicle_local_position_s &position, bool keep_heading)
-{
-	_v4_initialized = true;
-	_v4_action_state = V4ActionState::Hold;
-	_v4_target_position[0] = position.x;
-	_v4_target_position[1] = position.y;
-	_v4_target_position[2] = position.z;
-	_v4_command_position[0] = position.x;
-	_v4_command_position[1] = position.y;
-	_v4_command_position[2] = position.z;
-	_v4_command_velocity[0] = 0.f;
-	_v4_command_velocity[1] = 0.f;
-	_v4_command_velocity[2] = 0.f;
-	_v4_yaw_ref = keep_heading && v4HeadingValid(position) ? position.heading : NAN;
-	_v4_heading_reset_ref = position.heading_reset_counter;
-	_v4_bad_yaw_since = 0;
-}
-
-void MylinkBridge::cancelV4ToHold(const vehicle_local_position_s &position,
-				 bool count_heading_abort, bool count_heading_reset)
-{
-	if (count_heading_abort) {
-		_v4_heading_abort++;
-	}
-
-	if (count_heading_reset) {
-		_v4_heading_reset_abort++;
-	}
-
-	captureV4Hold(position, v4HeadingValid(position));
-}
-
-void MylinkBridge::handleV4UserCommand(const mavlink_message_t &message, GateState state,
-				       const mavlink_command_long_t &command)
-{
-	_v4_rx_command++;
-
-	auto reject = [&](uint8_t result) {
-		_v4_rejected++;
-		sendCommandAck(MAV_CMD_USER_1, result, UINT8_MAX, 0, message.sysid, message.compid);
-	};
-
-	if (state != GateState::Active) {
-		reject(MAV_RESULT_TEMPORARILY_REJECTED);
-		return;
-	}
-
-	if (!PX4_ISFINITE(command.param1) || fabsf(command.param1 - roundf(command.param1)) > 0.001f
-	    || command.param1 < kV4ActionTakeoff || command.param1 > kV4ActionHold) {
-		reject(MAV_RESULT_DENIED);
-		return;
-	}
-
-	const uint8_t action = static_cast<uint8_t>(lroundf(command.param1));
-	vehicle_local_position_s position{};
-	if (!_vehicle_local_position_sub.copy(&position) || position.timestamp == 0
-	    || !PX4_ISFINITE(position.x) || !PX4_ISFINITE(position.y) || !PX4_ISFINITE(position.z)) {
-		reject(MAV_RESULT_TEMPORARILY_REJECTED);
-		return;
-	}
-
-	if (action == kV4ActionHold) {
-		captureV4Hold(position, true);
-		_setpoint_cache_valid = false;
-		_v4_hold_count++;
-		_v4_accepted++;
-		sendCommandAck(MAV_CMD_USER_1, MAV_RESULT_ACCEPTED, UINT8_MAX, 0, message.sysid, message.compid);
-		return;
-	}
-
-	if (_v4_action_state == V4ActionState::Landing) {
-		_v4_busy_rejected++;
-		reject(MAV_RESULT_TEMPORARILY_REJECTED);
-		return;
-	}
-
-	if (v4Busy()) {
-		_v4_busy_rejected++;
-		reject(MAV_RESULT_TEMPORARILY_REJECTED);
-		return;
-	}
-
-	if (!PX4_ISFINITE(command.param2) || command.param2 <= 0.f) {
-		reject(MAV_RESULT_DENIED);
-		return;
-	}
-
-	const bool horizontal = action >= kV4ActionForward && action <= kV4ActionRight;
-	if (horizontal && !v4HeadingValid(position)) {
-		_v4_heading_invalid_reject++;
-		reject(MAV_RESULT_TEMPORARILY_REJECTED);
-		return;
-	}
-
-	float amount = command.param2;
-	if (horizontal) {
-		amount = math::min(amount, kV4MaxHorizontalStep);
-	}
-
-	_v4_initialized = true;
-	_v4_action_state = action == kV4ActionTakeoff ? V4ActionState::Takeoff
-				 : horizontal ? V4ActionState::HorizontalMove : V4ActionState::VerticalMove;
-	_v4_target_position[0] = position.x;
-	_v4_target_position[1] = position.y;
-	_v4_target_position[2] = position.z;
-	_v4_command_position[0] = position.x;
-	_v4_command_position[1] = position.y;
-	_v4_command_position[2] = position.z;
-	_v4_command_velocity[0] = 0.f;
-	_v4_command_velocity[1] = 0.f;
-	_v4_command_velocity[2] = 0.f;
-	_v4_yaw_ref = v4HeadingValid(position) ? position.heading : NAN;
-	_v4_heading_reset_ref = position.heading_reset_counter;
-	_v4_bad_yaw_since = 0;
-	_setpoint_cache_valid = false;
-
-	if (action == kV4ActionTakeoff) {
-		_v4_target_position[2] = position.z - amount;
-		_v4_takeoff_count++;
-
-	} else if (horizontal) {
-		const float heading = position.heading;
-		const float c = cosf(heading);
-		const float s = sinf(heading);
-		float dx = 0.f;
-		float dy = 0.f;
-
-		switch (action) {
-		case kV4ActionForward:
-			dx = amount * c; dy = amount * s; break;
-		case kV4ActionBack:
-			dx = -amount * c; dy = -amount * s; break;
-		case kV4ActionRight:
-			dx = -amount * s; dy = amount * c; break;
-		case kV4ActionLeft:
-			dx = amount * s; dy = -amount * c; break;
-		default:
-			break;
-		}
-
-		_v4_target_position[0] += dx;
-		_v4_target_position[1] += dy;
-		_v4_move_count++;
-
-	} else {
-		_v4_target_position[2] += action == kV4ActionUp ? -amount : amount;
-	}
-
-	_v4_accepted++;
-	sendCommandAck(MAV_CMD_USER_1, MAV_RESULT_ACCEPTED, UINT8_MAX, 0, message.sysid, message.compid);
-}
-
-void MylinkBridge::handleCommandLong(const mavlink_message_t &message, GateState state)
+void MylinkBridge::handleCommandLong(const mavlink_message_t &message)
 {
 	mavlink_command_long_t command{};
 	mavlink_msg_command_long_decode(&message, &command);
 
 	if (!targetOk(command.target_system, command.target_component)) {
-		recordDrop(message, state, DropReason::InvalidTarget, command.command);
-		return;
-	}
-
-	if (command.command == MAV_CMD_USER_1) {
-		handleV4UserCommand(message, state, command);
 		return;
 	}
 
 	if (command.command == MAV_CMD_DO_SET_MODE) {
-		const uint8_t base_mode = static_cast<uint8_t>(command.param1);
-		const uint8_t custom_main_mode = static_cast<uint8_t>(command.param2);
-		const bool requests_offboard = (base_mode & MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)
-					       && custom_main_mode == 6;
-
-		if (requests_offboard) {
-			handleOffboardModeCommand(message, command);
-
-		} else {
-			sendCommandAck(command.command, MAV_RESULT_DENIED, UINT8_MAX, 0, message.sysid, message.compid);
-			recordDrop(message, state, DropReason::ForbiddenCommand, command.command);
-		}
-
+		handleOffboardModeCommand(message, command);
 		return;
 	}
 
 	if (command.command == MAV_CMD_NAV_LAND) {
-		_v4_action_state = V4ActionState::Landing;
-		_setpoint_cache_valid = false;
-		_v4_land_count++;
-		handleLandCommand(message, command);
-		return;
-	}
-
-	if (command.command == MAV_CMD_COMPONENT_ARM_DISARM) {
-		publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM);
-		return;
-	}
-
-	if (command.command == MAV_CMD_NAV_TAKEOFF) {
-		publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_NAV_TAKEOFF);
+		publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_NAV_LAND);
+		_handled_messages++;
 		return;
 	}
 
 	if (command.command == MAV_CMD_DO_MOTOR_TEST || command.command == MAV_CMD_DO_SET_ACTUATOR) {
 		sendCommandAck(command.command, MAV_RESULT_DENIED, UINT8_MAX, 0, message.sysid, message.compid);
-		recordDrop(message, state, DropReason::ForbiddenCommand, command.command);
+		_unsupported_messages++;
 		return;
 	}
 
-	sendCommandAck(command.command, MAV_RESULT_UNSUPPORTED, UINT8_MAX, 0, message.sysid, message.compid);
-	_unsupported_messages++;
-	recordDrop(message, state, DropReason::UnsupportedCommand, command.command);
+	if (!commandSupported(command.command)) {
+		sendCommandAck(command.command, MAV_RESULT_UNSUPPORTED, UINT8_MAX, 0, message.sysid, message.compid);
+		_unsupported_messages++;
+		return;
+	}
 }
 
 void MylinkBridge::handleMotorTestCommand(const mavlink_message_t &message,
@@ -838,60 +412,37 @@ void MylinkBridge::handleOffboardModeCommand(const mavlink_message_t &message,
 		return;
 	}
 
-	publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_DO_SET_MODE);
+	vehicle_command_s vehicle_command{};
+	vehicle_command.timestamp = hrt_absolute_time();
+	vehicle_command.param1 = command.param1;
+	vehicle_command.param2 = command.param2;
+	vehicle_command.param3 = command.param3;
+	vehicle_command.param4 = command.param4;
+	vehicle_command.param5 = command.param5;
+	vehicle_command.param6 = command.param6;
+	vehicle_command.param7 = command.param7;
+	vehicle_command.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+	vehicle_command.target_system = command.target_system;
+	vehicle_command.target_component = command.target_component;
+	vehicle_command.source_system = message.sysid;
+	vehicle_command.source_component = message.compid;
+	vehicle_command.confirmation = command.confirmation;
+	vehicle_command.from_external = true;
+	_vehicle_command_pub.publish(vehicle_command);
 	_offboard_mode_requests++;
+	_handled_messages++;
 }
 
-void MylinkBridge::handleLandCommand(const mavlink_message_t &message,
-				    const mavlink_command_long_t &command)
-{
-	publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_NAV_LAND);
-}
-
-void MylinkBridge::handleCommandInt(const mavlink_message_t &message, GateState state)
+void MylinkBridge::handleCommandInt(const mavlink_message_t &message)
 {
 	mavlink_command_int_t command{};
 	mavlink_msg_command_int_decode(&message, &command);
 
-	if (!targetOk(command.target_system, command.target_component)) {
-		recordDrop(message, state, DropReason::InvalidTarget, command.command);
-		return;
+	if (targetOk(command.target_system, command.target_component)) {
+		sendCommandAck(command.command, MAV_RESULT_COMMAND_LONG_ONLY, UINT8_MAX, 0,
+			       message.sysid, message.compid);
+		_unsupported_messages++;
 	}
-
-	if (command.command == MAV_CMD_NAV_LAND) {
-		vehicle_command_s vehicle_command{};
-		vehicle_command.timestamp = hrt_absolute_time();
-		vehicle_command.param1 = command.param1;
-		vehicle_command.param2 = command.param2;
-		vehicle_command.param3 = command.param3;
-		vehicle_command.param4 = command.param4;
-		vehicle_command.param5 = static_cast<double>(command.x) * 1e-7;
-		vehicle_command.param6 = static_cast<double>(command.y) * 1e-7;
-		vehicle_command.param7 = command.z;
-		vehicle_command.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
-		vehicle_command.target_system = command.target_system;
-		vehicle_command.target_component = command.target_component;
-		vehicle_command.source_system = message.sysid;
-		vehicle_command.source_component = message.compid;
-		vehicle_command.confirmation = false;
-		vehicle_command.from_external = true;
-		_vehicle_command_pub.publish(vehicle_command);
-		_peer_system_id = message.sysid;
-		_peer_component_id = message.compid;
-		_handled_messages++;
-		return;
-	}
-
-	if (command.command == MAV_CMD_DO_MOTOR_TEST || command.command == MAV_CMD_DO_SET_ACTUATOR) {
-		sendCommandAck(command.command, MAV_RESULT_DENIED, UINT8_MAX, 0, message.sysid, message.compid);
-		recordDrop(message, state, DropReason::ForbiddenCommand, command.command);
-		return;
-	}
-
-	sendCommandAck(command.command, MAV_RESULT_COMMAND_LONG_ONLY, UINT8_MAX, 0,
-		       message.sysid, message.compid);
-	_unsupported_messages++;
-	recordDrop(message, state, DropReason::UnsupportedCommand, command.command);
 }
 
 bool MylinkBridge::decodeLocalNedSetpoint(const mavlink_message_t &message,
@@ -945,151 +496,6 @@ bool MylinkBridge::decodeLocalNedSetpoint(const mavlink_message_t &message,
 	return true;
 }
 
-void MylinkBridge::updateV4Setpoint(GateState state)
-{
-	if (state == GateState::Closed || _setpoint_cache_valid) {
-		return;
-	}
-
-	vehicle_local_position_s actual{};
-	if (!_vehicle_local_position_sub.copy(&actual) || actual.timestamp == 0
-	    || !PX4_ISFINITE(actual.x) || !PX4_ISFINITE(actual.y) || !PX4_ISFINITE(actual.z)) {
-		return;
-	}
-
-	if (!_v4_initialized) {
-		captureV4Hold(actual, true);
-	}
-
-	if (state != GateState::Active && v4Busy()) {
-		captureV4Hold(actual, v4HeadingValid(actual));
-	}
-
-	const hrt_abstime now = hrt_absolute_time();
-	const float dt = _v4_last_setpoint == 0 ? 0.05f
-			 : math::constrain(static_cast<float>(now - _v4_last_setpoint) * 1e-6f, 0.01f, 0.10f);
-	_v4_last_setpoint = now;
-
-	if (v4Busy()) {
-		if (actual.heading_reset_counter != _v4_heading_reset_ref) {
-			cancelV4ToHold(actual, false, true);
-
-		} else if (!v4HeadingValid(actual)) {
-			cancelV4ToHold(actual, true, false);
-
-		} else if (PX4_ISFINITE(_v4_yaw_ref)) {
-			const float yaw_error = wrapPi(actual.heading - _v4_yaw_ref);
-
-			if (fabsf(yaw_error) > kV4YawAbortRadians) {
-				if (_v4_bad_yaw_since == 0) {
-					_v4_bad_yaw_since = now;
-				}
-
-				if (now - _v4_bad_yaw_since >= kV4YawAbortTime) {
-					cancelV4ToHold(actual, true, false);
-				}
-
-			} else {
-				_v4_bad_yaw_since = 0;
-			}
-		}
-	}
-
-	if (_v4_action_state == V4ActionState::Takeoff) {
-		_v4_command_position[0] = _v4_target_position[0];
-		_v4_command_position[1] = _v4_target_position[1];
-		_v4_command_position[2] = _v4_target_position[2];
-		_v4_command_velocity[0] = 0.f;
-		_v4_command_velocity[1] = 0.f;
-		_v4_command_velocity[2] = 0.f;
-
-		if (fabsf(actual.z - _v4_target_position[2]) <= kV4PositionTolerance
-		    && fabsf(actual.vz) <= kV4VelocityTolerance) {
-			_v4_action_state = V4ActionState::Hold;
-		}
-
-	} else if (_v4_action_state == V4ActionState::HorizontalMove
-		   || _v4_action_state == V4ActionState::VerticalMove) {
-		const bool horizontal = _v4_action_state == V4ActionState::HorizontalMove;
-		const float ex = _v4_target_position[0] - _v4_command_position[0];
-		const float ey = _v4_target_position[1] - _v4_command_position[1];
-		const float ez = _v4_target_position[2] - _v4_command_position[2];
-		const float distance = horizontal ? hypotf(ex, ey) : fabsf(ez);
-
-		if (distance <= 1e-4f) {
-			_v4_command_position[0] = _v4_target_position[0];
-			_v4_command_position[1] = _v4_target_position[1];
-			_v4_command_position[2] = _v4_target_position[2];
-			_v4_command_velocity[0] = 0.f;
-			_v4_command_velocity[1] = 0.f;
-			_v4_command_velocity[2] = 0.f;
-			_v4_action_state = V4ActionState::Hold;
-
-		} else {
-			const float desired_speed = math::min(kV4MaxHorizontalSpeed,
-					 sqrtf(fmaxf(0.f, 2.f * kV4MaxAcceleration * distance)));
-			const float step = math::min(distance, desired_speed * dt);
-
-			if (horizontal) {
-				const float scale = step / distance;
-				_v4_command_position[0] += ex * scale;
-				_v4_command_position[1] += ey * scale;
-				_v4_command_velocity[0] = ex / distance * desired_speed;
-				_v4_command_velocity[1] = ey / distance * desired_speed;
-				_v4_command_velocity[2] = 0.f;
-
-			} else {
-				_v4_command_position[2] += ez / distance * step;
-				_v4_command_velocity[0] = 0.f;
-				_v4_command_velocity[1] = 0.f;
-				_v4_command_velocity[2] = ez / distance * desired_speed;
-			}
-
-			if (step >= distance - 1e-5f) {
-				_v4_command_position[0] = _v4_target_position[0];
-				_v4_command_position[1] = _v4_target_position[1];
-				_v4_command_position[2] = _v4_target_position[2];
-				_v4_command_velocity[0] = 0.f;
-				_v4_command_velocity[1] = 0.f;
-				_v4_command_velocity[2] = 0.f;
-				_v4_action_state = V4ActionState::Hold;
-			}
-		}
-	}
-
-	trajectory_setpoint_s setpoint{};
-	for (unsigned i = 0; i < 3; ++i) {
-		setpoint.position[i] = _v4_command_position[i];
-		setpoint.velocity[i] = NAN;
-		setpoint.acceleration[i] = NAN;
-		setpoint.jerk[i] = NAN;
-	}
-
-	const bool use_velocity = _v4_action_state == V4ActionState::HorizontalMove
-				 || _v4_action_state == V4ActionState::VerticalMove;
-	if (use_velocity) {
-		for (unsigned i = 0; i < 3; ++i) {
-			setpoint.velocity[i] = _v4_command_velocity[i];
-		}
-	}
-
-	setpoint.yaw = PX4_ISFINITE(_v4_yaw_ref) ? _v4_yaw_ref : NAN;
-	setpoint.yawspeed = NAN;
-	setpoint.timestamp = now;
-
-	offboard_control_mode_s control_mode{};
-	control_mode.timestamp = now;
-	control_mode.position = true;
-	control_mode.velocity = use_velocity;
-	control_mode.acceleration = false;
-	control_mode.attitude = PX4_ISFINITE(setpoint.yaw);
-	control_mode.body_rate = false;
-	_offboard_control_mode_pub.publish(control_mode);
-	_offboard_control_mode_published++;
-	_trajectory_setpoint_pub.publish(setpoint);
-	_trajectory_setpoints_published++;
-}
-
 void MylinkBridge::handleSetPositionTargetLocalNed(const mavlink_message_t &message, GateState state)
 {
 	// Direct motor control owns the Offboard control type while it is active.
@@ -1103,7 +509,6 @@ void MylinkBridge::handleSetPositionTargetLocalNed(const mavlink_message_t &mess
 
 	if (!decodeLocalNedSetpoint(message, setpoint, control_mode)) {
 		_invalid_setpoints++;
-		recordDrop(message, state, DropReason::InvalidPayload);
 		return;
 	}
 
@@ -1131,9 +536,9 @@ void MylinkBridge::handleSetPositionTargetLocalNed(const mavlink_message_t &mess
 
 bool MylinkBridge::cacheableMessage(const mavlink_message_t &message) const
 {
-	// Cache only actionable control commands. Diagnostic PING messages must
-	// never overwrite a command waiting for Offboard activation.
-	return message.msgid == MAVLINK_MSG_ID_COMMAND_LONG;
+	// V3 never queues or replays control input. Local-NED messages are handled
+	// only when received, so stopping the sender stops the heartbeat/setpoint.
+	return false;
 }
 
 void MylinkBridge::cacheMessage(const mavlink_message_t &message)
@@ -1145,9 +550,7 @@ void MylinkBridge::cacheMessage(const mavlink_message_t &message)
 
 void MylinkBridge::clearSessionState()
 {
-	_direct_motor_active = false;
-	_direct_motor_stopping = false;
-	_motor_throttle_percent = 0.f;
+	releaseDirectMotorControl(false);
 	_cached_message = {};
 	_latest_command = {};
 	_latest_setpoint = {};
@@ -1156,60 +559,73 @@ void MylinkBridge::clearSessionState()
 	_last_setpoint_rx = 0;
 	_event_flags = EventNone;
 	_latest_event_command = 0;
-	_v4_initialized = false;
-	_v4_action_state = V4ActionState::Hold;
-	_v4_yaw_ref = NAN;
-	_v4_bad_yaw_since = 0;
-	_v4_last_setpoint = 0;
 	_session_resets++;
 }
 
 void MylinkBridge::processMavlinkMessage(const mavlink_message_t &message)
 {
-	handleMavlinkMessage(message);
-}
-
-void MylinkBridge::handleMavlinkMessage(const mavlink_message_t &message)
-{
-	const GateState state = gateState();
-
 	switch (message.msgid) {
 	case MAVLINK_MSG_ID_PING:
 		handlePing(message);
 		break;
 
-	case MAVLINK_MSG_ID_HEARTBEAT:
-		handleHeartbeat(message);
-		break;
-
 	case MAVLINK_MSG_ID_COMMAND_LONG:
-		handleCommandLong(message, state);
+		handleCommandLong(message);
 		break;
 
 	case MAVLINK_MSG_ID_COMMAND_INT:
-		handleCommandInt(message, state);
+		handleCommandInt(message);
 		break;
 
 	case MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED:
-		if (state == GateState::Closed) {
-			recordDrop(message, state, DropReason::GateClosed);
-
-		} else {
-			handleSetPositionTargetLocalNed(message, state);
-		}
-
-		break;
-
-	case MAVLINK_MSG_ID_MANUAL_CONTROL:
-	case MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE:
-		recordDrop(message, state, DropReason::ForbiddenMessage);
+		handleSetPositionTargetLocalNed(message, GateState::Active);
 		break;
 
 	default:
 		_unsupported_messages++;
-		recordDrop(message, state, DropReason::UnsupportedMessage);
 		break;
 	}
+}
+
+void MylinkBridge::handleMavlinkMessage(const mavlink_message_t &message)
+{
+	if (message.msgid == MAVLINK_MSG_ID_PING) {
+		handlePing(message);
+		return;
+	}
+
+	if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+		handleHeartbeat(message);
+		return;
+	}
+
+	const GateState state = gateState();
+
+	if (state == GateState::Closed) {
+		_gate_dropped_frames++;
+		return;
+	}
+
+	if (state == GateState::CacheOnly) {
+		if (message.msgid == MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED) {
+			handleSetPositionTargetLocalNed(message, state);
+
+		} else if (message.msgid == MAVLINK_MSG_ID_COMMAND_LONG) {
+			// Mode requests and LAND are forwarded immediately. All other
+			// commands are rejected; V3 has no command queue.
+			handleCommandLong(message);
+
+		} else if (cacheableMessage(message)) {
+			cacheMessage(message);
+
+		} else {
+			_unsupported_messages++;
+		}
+
+		return;
+	}
+
+	processMavlinkMessage(message);
 }
 
 void MylinkBridge::updateGateAndCachedMessage()
@@ -1218,16 +634,6 @@ void MylinkBridge::updateGateAndCachedMessage()
 	const GateState state = gateState(&status);
 	const bool armed = status.timestamp != 0
 			   && status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
-	const GateState previous_state = _last_gate_state;
-
-	updateGateStateLog(state, status);
-
-	if (previous_state == GateState::Active && state != GateState::Active && _v4_initialized && v4Busy()) {
-		vehicle_local_position_s position{};
-		if (_vehicle_local_position_sub.copy(&position) && position.timestamp != 0) {
-			captureV4Hold(position, v4HeadingValid(position));
-		}
-	}
 
 	if (_was_armed && !armed) {
 		clearSessionState();
@@ -1235,152 +641,9 @@ void MylinkBridge::updateGateAndCachedMessage()
 
 	_was_armed = armed;
 
-	// V3 does not replay control commands after a gate transition. Keep the
-	// legacy storage members for rollback, but discard any pending entry.
-	if (_cache_valid) {
-		_cached_message = {};
-		_cache_valid = false;
-	}
-}
 
-void MylinkBridge::forwardCommandAcks()
-{
-	vehicle_command_ack_s ack{};
+	updateDirectMotorControl(state);
 
-	while (_vehicle_command_ack_sub.update(&ack)) {
-		if (ack.from_external || _peer_system_id == 0
-		    || ack.target_system != _peer_system_id
-		    || ack.target_component != _peer_component_id
-		    || ack.target_component > UINT8_MAX) {
-			continue;
-		}
-
-		sendCommandAck(static_cast<uint16_t>(ack.command), ack.result, ack.result_param1,
-			       ack.result_param2, ack.target_system, static_cast<uint8_t>(ack.target_component));
-		_command_acks_forwarded++;
-	}
-}
-
-void MylinkBridge::sendHeartbeat()
-{
-	vehicle_status_s status{};
-	_vehicle_status_sub.copy(&status);
-
-	uint8_t base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-
-	if (status.arming_state == vehicle_status_s::ARMING_STATE_ARMED) {
-		base_mode |= MAV_MODE_FLAG_SAFETY_ARMED;
-	}
-
-	if (status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD) {
-		base_mode |= MAV_MODE_FLAG_GUIDED_ENABLED | MAV_MODE_FLAG_STABILIZE_ENABLED;
-	}
-
-	uint8_t vehicle_type = MAV_TYPE_GENERIC;
-
-	if (status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
-		vehicle_type = MAV_TYPE_QUADROTOR;
-
-	} else if (status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) {
-		vehicle_type = MAV_TYPE_FIXED_WING;
-
-	} else if (status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROVER) {
-		vehicle_type = MAV_TYPE_GROUND_ROVER;
-	}
-
-	const uint8_t system_state = status.arming_state == vehicle_status_s::ARMING_STATE_ARMED
-				     ? (status.failsafe ? MAV_STATE_CRITICAL : MAV_STATE_ACTIVE)
-				     : (status.pre_flight_checks_pass ? MAV_STATE_STANDBY : MAV_STATE_UNINIT);
-	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
-	const uint8_t component_id = status.component_id > 0 ? status.component_id
-				     : static_cast<uint8_t>(MAV_COMP_ID_AUTOPILOT1);
-	mavlink_message_t message{};
-	mavlink_msg_heartbeat_pack_status(system_id, component_id, &_tx_status, &message,
-					 vehicle_type, MAV_AUTOPILOT_PX4, base_mode,
-					 customMode(status.nav_state_display), system_state);
-	sendMavlinkMessage(message);
-	_heartbeats_sent++;
-}
-
-void MylinkBridge::sendLocalPositionNed()
-{
-	vehicle_local_position_s position{};
-
-	if (!_vehicle_local_position_sub.copy(&position) || position.timestamp == 0) {
-		return;
-	}
-
-	vehicle_status_s status{};
-	_vehicle_status_sub.copy(&status);
-	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
-	const uint8_t component_id = status.component_id > 0 ? status.component_id
-				     : static_cast<uint8_t>(MAV_COMP_ID_AUTOPILOT1);
-	mavlink_message_t message{};
-	mavlink_msg_local_position_ned_pack_status(system_id, component_id, &_tx_status, &message,
-						  static_cast<uint32_t>(position.timestamp / 1000),
-						  position.x, position.y, position.z, position.vx, position.vy, position.vz);
-	sendMavlinkMessage(message);
-	_local_positions_sent++;
-}
-
-void MylinkBridge::sendBatteryStatus()
-{
-	battery_status_s battery{};
-
-	if (!_battery_status_sub.copy(&battery) || battery.timestamp == 0) {
-		return;
-	}
-
-	uint16_t voltages[10];
-
-	for (uint16_t &voltage : voltages) {
-		voltage = UINT16_MAX;
-	}
-
-	if (battery.connected && battery.voltage_v > 0.f) {
-		voltages[0] = battery.voltage_v < 65.534f
-			      ? static_cast<uint16_t>(battery.voltage_v * 1000.f) : UINT16_MAX - 1;
-	}
-
-	const int16_t current = battery.connected && battery.current_a >= 0.f
-				? (battery.current_a < 327.67f ? static_cast<int16_t>(battery.current_a * 100.f) : INT16_MAX)
-				: -1;
-	const int8_t remaining = battery.connected && battery.remaining >= 0.f
-				 ? (battery.remaining < 1.f ? static_cast<int8_t>(battery.remaining * 100.f) : 100) : -1;
-	uint16_t voltages_ext[4]{};
-	vehicle_status_s status{};
-	_vehicle_status_sub.copy(&status);
-	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
-	const uint8_t component_id = status.component_id > 0 ? status.component_id
-				     : static_cast<uint8_t>(MAV_COMP_ID_AUTOPILOT1);
-	mavlink_message_t message{};
-	mavlink_msg_battery_status_pack_status(system_id, component_id, &_tx_status, &message,
-					      battery.id > 0 ? battery.id - 1 : 0,
-					      MAV_BATTERY_FUNCTION_ALL, MAV_BATTERY_TYPE_LIPO, INT16_MAX, voltages,
-					      current, -1, -1, remaining, 0, MAV_BATTERY_CHARGE_STATE_UNDEFINED,
-					      voltages_ext, MAV_BATTERY_MODE_UNKNOWN, battery.faults);
-	sendMavlinkMessage(message);
-	_battery_status_sent++;
-}
-
-void MylinkBridge::updateTelemetry()
-{
-	const hrt_abstime now = hrt_absolute_time();
-
-	if (_last_heartbeat_tx == 0 || now - _last_heartbeat_tx >= kHeartbeatInterval) {
-		_last_heartbeat_tx = now;
-		sendHeartbeat();
-	}
-
-	if (_last_local_position_tx == 0 || now - _last_local_position_tx >= kLocalPositionInterval) {
-		_last_local_position_tx = now;
-		sendLocalPositionNed();
-	}
-
-	if (_last_battery_status_tx == 0 || now - _last_battery_status_tx >= kBatteryStatusInterval) {
-		_last_battery_status_tx = now;
-		sendBatteryStatus();
-	}
 }
 
 void MylinkBridge::readSerial()
@@ -1465,14 +728,6 @@ void MylinkBridge::Run()
 	perf_count(_loop_interval_perf);
 	updateGateAndCachedMessage();
 	readSerial();
-	const GateState state = gateState();
-	const hrt_abstime now = hrt_absolute_time();
-	if (!_setpoint_cache_valid && state != GateState::Closed
-	    && (_v4_last_setpoint == 0 || now - _v4_last_setpoint >= kV4SetpointInterval)) {
-		updateV4Setpoint(state);
-	}
-	forwardCommandAcks();
-	updateTelemetry();
 	perf_end(_loop_perf);
 }
 
@@ -1529,20 +784,42 @@ int MylinkBridge::print_status()
 {
 	vehicle_status_s status{};
 	const GateState state = gateState(&status);
-	PX4_INFO("%s gate=%s arm=%u nav=%u rx=%" PRIu32 " drop=%" PRIu32 " tx=%" PRIu32 "/%" PRIu32,
-		 _serial.getPort(), gateStateName(state),
-		 status.arming_state == vehicle_status_s::ARMING_STATE_ARMED, status.nav_state,
-		 _valid_frames, _gate_dropped_frames, _tx_frames, _tx_errors);
-	PX4_INFO("offboard=%" PRIu32 "/%" PRIu32 "/%" PRIu32 " telemetry=%" PRIu32 "/%" PRIu32 "/%" PRIu32
-			 "/%" PRIu32,
-			 _offboard_setpoints_received, _offboard_control_mode_published, _trajectory_setpoints_published,
-			 _heartbeats_sent, _command_acks_forwarded, _local_positions_sent, _battery_status_sent);
-	PX4_INFO("v4 rx=%" PRIu32 " ack=%" PRIu32 " accepted=%" PRIu32 " rejected=%" PRIu32 " busy=%" PRIu32,
-		 _v4_rx_command, _v4_ack_sent, _v4_accepted, _v4_rejected, _v4_busy_rejected);
-	PX4_INFO("v4 actions takeoff=%" PRIu32 " move=%" PRIu32 " hold=%" PRIu32 " land=%" PRIu32,
-		 _v4_takeoff_count, _v4_move_count, _v4_hold_count, _v4_land_count);
-	PX4_INFO("v4 heading invalid=%" PRIu32 " abort=%" PRIu32 " reset_abort=%" PRIu32,
-		 _v4_heading_invalid_reject, _v4_heading_abort, _v4_heading_reset_abort);
+	const char *state_name = state == GateState::Active ? "ACTIVE" :
+				state == GateState::CacheOnly ? "CACHE_ONLY" : "CLOSED";
+	PX4_INFO("port=%s baud=%" PRIu32 " MAVLink2 gate=%s armed=%s nav_state=%u",
+		 _serial.getPort(), _serial.getBaudrate(), state_name,
+		 status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "yes" : "no",
+		 status.nav_state);
+	PX4_INFO("rx: bytes=%" PRIu32 " valid_frames=%" PRIu32 " bad_frames=%" PRIu32
+		 " gate_dropped=%" PRIu32 " cached_updates=%" PRIu32 " handled=%" PRIu32 " unsupported=%" PRIu32,
+		 _rx_bytes, _valid_frames, _bad_frames, _gate_dropped_frames,
+		 _cached_updates, _handled_messages, _unsupported_messages);
+	PX4_INFO("session: cache_valid=%s cached_msgid=%" PRIu32 " event_flags=0x%08" PRIx32
+		 " latest_command=%u setpoint_cache=%s resets=%" PRIu32,
+		 _cache_valid ? "yes" : "no", _cache_valid ? _cached_message.msgid : 0,
+		 _event_flags, _latest_event_command, _setpoint_cache_valid ? "yes" : "no", _session_resets);
+	const hrt_abstime now = hrt_absolute_time();
+	const uint64_t setpoint_age_ms = _last_setpoint_rx > 0 && now >= _last_setpoint_rx
+					 ? (now - _last_setpoint_rx) / 1000 : 0;
+	PX4_INFO("offboard: received=%" PRIu32 " ocm_published=%" PRIu32
+		 " trajectory_published=%" PRIu32 " mode_requests=%" PRIu32
+		 " invalid=%" PRIu32 " last_age_ms=%" PRIu64,
+		 _offboard_setpoints_received, _offboard_control_mode_published,
+		 _trajectory_setpoints_published, _offboard_mode_requests,
+		 _invalid_setpoints, setpoint_age_ms);
+	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
+		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
+		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,
+		 (_event_flags & EventContinue) != 0, (_event_flags & EventRtl) != 0,
+		 (_event_flags & EventMissionStart) != 0);
+	PX4_INFO("motor_test: event=%u active=%s function=%u throttle=%.1f%% commands=%" PRIu32
+		 " invalid=%" PRIu32 " setpoints=%" PRIu32 " releases=%" PRIu32,
+		 (_event_flags & EventMotorThrottle) != 0, _direct_motor_active ? "yes" : "no",
+		 _direct_motor_active ? kDirectMotorCount : 0, (double)_motor_throttle_percent, _motor_test_commands,
+		 _invalid_motor_test_commands, _direct_motor_setpoints_published, _motor_test_releases);
+	PX4_INFO("tx: frames=%" PRIu32 " bytes=%" PRIu32 " errors=%" PRIu32
+		 " rx_errors=%" PRIu32 " last_rx_errno=%d last_tx_errno=%d",
+		 _tx_frames, _tx_bytes, _tx_errors, _rx_errors, _last_rx_errno, _last_tx_errno);
 	perf_print_counter(_loop_perf);
 	perf_print_counter(_loop_interval_perf);
 	return 0;
