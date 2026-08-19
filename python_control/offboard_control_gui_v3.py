@@ -1383,22 +1383,53 @@ class MyLinkController:
 
 
 class OffboardControlGuiV3:
+    MODE_ZH = {
+        "DISCONNECTED": "未连接",
+        "MANUAL": "手动模式",
+        "ALTCTL": "高度模式",
+        "POSCTL": "位置模式",
+        "AUTO": "自动模式",
+        "AUTO.READY": "自动准备",
+        "AUTO.TAKEOFF": "自动起飞",
+        "AUTO.LOITER": "自动悬停",
+        "AUTO.MISSION": "自动任务",
+        "AUTO.RTL": "自动返航",
+        "AUTO.LAND": "自动降落",
+        "AUTO.FOLLOW": "自动跟随",
+        "AUTO.PRECLAND": "精确降落",
+        "ACRO": "特技模式",
+        "OFFBOARD": "外部控制模式",
+        "STABILIZED": "稳定模式",
+        "RATTITUDE": "半自稳模式",
+        "TERMINATION": "飞行终止",
+    }
+
     TEXT = {
         "zh": {
             "title": "PX4 MyLink Offboard 控制台 V3", "connection": "MAVLink UDP 连接",
             "connect": "连接", "disconnect": "断开", "language": "语言", "state": "PX4 状态",
             "control": "控制", "events": "事件日志", "address": "MAVLink UDP 地址",
-            "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "CUSTOM",
+            "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "寻顶模式",
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
+            "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
+            "battery_row": "电池", "target_row": "最终目标", "command_row": "当前指令",
+            "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
+            "mode": "模式", "armed": "解锁状态", "armed_yes": "已解锁", "armed_no": "未解锁",
+            "heartbeat": "心跳", "north": "北", "east": "东", "down_axis": "下", "speed": "速度",
         },
         "en": {
             "title": "PX4 MyLink Offboard Console V3", "connection": "MAVLink UDP connection",
             "connect": "CONNECT", "disconnect": "DISCONNECT", "language": "Language", "state": "PX4 STATUS",
             "control": "CONTROL", "events": "EVENT LOG", "address": "MAVLink UDP address",
-            "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "CUSTOM", "forward": "FORWARD",
+            "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "SEARCH TOP", "forward": "FORWARD",
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
+            "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
+            "battery_row": "Battery", "target_row": "Final target", "command_row": "Command",
+            "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
+            "mode": "mode", "armed": "armed", "armed_yes": "True", "armed_no": "False",
+            "heartbeat": "heartbeat", "north": "N", "east": "E", "down_axis": "D", "speed": "v",
         },
     }
 
@@ -1413,7 +1444,7 @@ class OffboardControlGuiV3:
         self.language_var = tk.StringVar(value="中文")
         self.altitude_var = tk.StringVar(value="1.0")
         self.distance_var = tk.StringVar(value="0.5")
-        self.status_var = tk.StringVar(value="DISCONNECTED")
+        self.status_var = tk.StringVar(value=self.tr("disconnected"))
         self.position_var = tk.StringVar(value="N —  E —  D —")
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
@@ -1427,6 +1458,9 @@ class OffboardControlGuiV3:
 
     def tr(self, key: str) -> str:
         return self.TEXT[self.language][key]
+
+    def display_mode(self, mode: str) -> str:
+        return self.MODE_ZH.get(mode, mode) if self.language == "zh" else mode
 
     def _switch_language(self, _event=None) -> None:
         self.language = "en" if self.language_var.get() == "English" else "zh"
@@ -1469,24 +1503,23 @@ class OffboardControlGuiV3:
         status = ttk.LabelFrame(root, text=self.tr("state"), padding=10)
         status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
         for row, (name, variable) in enumerate((
-            ("State", self.status_var),
-            ("Position", self.position_var),
-            ("Velocity", self.velocity_var),
-            ("Battery", self.battery_var),
-            ("Final target", self.target_var),
-            ("Command", self.command_var),
+            (self.tr("status_row"), self.status_var),
+            (self.tr("position_row"), self.position_var),
+            (self.tr("velocity_row"), self.velocity_var),
+            (self.tr("battery_row"), self.battery_var),
+            (self.tr("target_row"), self.target_var),
+            (self.tr("command_row"), self.command_var),
         )):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
 
         control = ttk.LabelFrame(root, text=self.tr("control"), padding=10)
         control.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=(0, 12))
-        for column in range(4):
+        for column in range(3):
             control.columnconfigure(column, weight=1)
         self.action_buttons: list[ttk.Button] = []
         top_actions = (
             ("takeoff", lambda: self.controller.takeoff(self.altitude_var.get())),
-            ("descend", lambda: self.controller.descend(self.distance_var.get())),
             ("land", self.controller.land),
             ("custom", self.controller.custom),
         )
@@ -1535,24 +1568,37 @@ class OffboardControlGuiV3:
             return
         state = self.controller.state()
         self.controller.sync_target_to_mode(state)
+        connection_text = self.tr("connected") if state.connected else self.tr("disconnected")
+        armed_text = self.tr("armed_yes") if state.armed else self.tr("armed_no")
         self.status_var.set(
-            f"{'CONNECTED' if state.connected else 'DISCONNECTED'} | SYS={state.system_id} COMP={state.component_id} | "
-            f"mode={state.mode} | armed={state.armed} | heartbeat={self._fmt(state.heartbeat_age_s)}s"
+            f"{connection_text} | {self.tr('system')}={state.system_id} {self.tr('component')}={state.component_id} | "
+            f"{self.tr('mode')}={self.display_mode(state.mode)} | {self.tr('armed')}={armed_text} | "
+            f"{self.tr('heartbeat')}={self._fmt(state.heartbeat_age_s)}s"
         )
-        self.position_var.set(f"N {self._fmt(state.x)}  E {self._fmt(state.y)}  D {self._fmt(state.z)}")
-        self.velocity_var.set(f"vx {self._fmt(state.vx)}  vy {self._fmt(state.vy)}  vz {self._fmt(state.vz)} m/s")
+        self.position_var.set(
+            f"{self.tr('north')} {self._fmt(state.x)}  {self.tr('east')} {self._fmt(state.y)}  "
+            f"{self.tr('down_axis')} {self._fmt(state.z)}"
+        )
+        self.velocity_var.set(
+            f"{self.tr('north')} {self._fmt(state.vx)}  {self.tr('east')} {self._fmt(state.vy)}  "
+            f"{self.tr('down_axis')} {self._fmt(state.vz)} m/s"
+        )
         self.battery_var.set(f"{state.battery_percent if state.battery_percent is not None else '—'}%  {self._fmt(state.battery_voltage_v)}V")
         target = self.controller.target
-        self.target_var.set("N —  E —  D —" if target is None else f"N {target[0]:.2f}  E {target[1]:.2f}  D {target[2]:.2f}")
+        axes = (self.tr("north"), self.tr("east"), self.tr("down_axis"))
+        self.target_var.set(
+            f"{axes[0]} —  {axes[1]} —  {axes[2]} —" if target is None
+            else f"{axes[0]} {target[0]:.2f}  {axes[1]} {target[1]:.2f}  {axes[2]} {target[2]:.2f}"
+        )
         command = self.controller.command_setpoint
         if command is None:
-            self.command_var.set("N —  E —  D — | v —")
+            self.command_var.set(f"{axes[0]} —  {axes[1]} —  {axes[2]} — | {self.tr('speed')} —")
         else:
             px, py, pz = command.command_position
             vx, vy, vz = command.command_velocity
             self.command_var.set(
-                f"N {px:.2f}  E {py:.2f}  D {pz:.2f} | "
-                f"v {math.sqrt(vx * vx + vy * vy + vz * vz):.2f} m/s"
+                f"{axes[0]} {px:.2f}  {axes[1]} {py:.2f}  {axes[2]} {pz:.2f} | "
+                f"{self.tr('speed')} {math.sqrt(vx * vx + vy * vy + vz * vz):.2f} m/s"
             )
         connected = state.connected
         busy = self.controller.busy
