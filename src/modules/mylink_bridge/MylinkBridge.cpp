@@ -34,6 +34,7 @@
 #include "MylinkBridge.hpp"
 
 #include <drivers/drv_hrt.h>
+#include <lib/custom_action_protocol/CustomActionProtocol.hpp>
 #include <mathlib/mathlib.h>
 #include <px4_platform_common/cli.h>
 #include <px4_platform_common/getopt.h>
@@ -113,6 +114,29 @@ bool MylinkBridge::targetOk(uint8_t target_system, uint8_t target_component)
 	       && (target_component == MAV_COMP_ID_ALL || target_component == component_id);
 }
 
+bool MylinkBridge::customTargetOk(uint8_t target_system, uint8_t target_component)
+{
+	vehicle_status_s status{};
+	_vehicle_status_sub.copy(&status);
+	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
+	return (target_system == 0 || target_system == system_id)
+	       && target_component == custom_action_protocol::kComponentId;
+}
+
+bool MylinkBridge::legacyControlAllowed()
+{
+	_custom_action_status_sub.update(&_custom_action_status);
+
+	if (_commander_owns_control) {
+		return false;
+	}
+
+	// Before the controller publishes its first status, retain the established
+	// V3 behavior. Once status exists, PX4 is the authority for ownership.
+	return _custom_action_status.timestamp == 0
+	       || _custom_action_status.control_owner == custom_action_status_s::OWNER_LEGACY;
+}
+
 bool MylinkBridge::commandSupported(uint16_t command) const
 {
 	return command == MAV_CMD_NAV_LAND;
@@ -183,6 +207,37 @@ void MylinkBridge::sendCommandAck(uint16_t command, uint8_t result, uint8_t prog
 	sendMavlinkMessage(response);
 }
 
+void MylinkBridge::sendVehicleCommandAck(const vehicle_command_ack_s &ack)
+{
+	vehicle_status_s status{};
+	_vehicle_status_sub.copy(&status);
+	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
+	const uint8_t source_component = ack.command == custom_action_protocol::kMavCmdUser1
+					 ? custom_action_protocol::kComponentId
+					 : static_cast<uint8_t>(MAV_COMP_ID_AUTOPILOT1);
+
+	mavlink_message_t response{};
+	mavlink_msg_command_ack_pack_status(system_id, source_component, &_tx_status, &response,
+					    static_cast<uint16_t>(ack.command), ack.result, ack.result_param1,
+					    ack.result_param2, ack.target_system,
+					    static_cast<uint8_t>(ack.target_component));
+	sendMavlinkMessage(response);
+}
+
+void MylinkBridge::relayVehicleCommandAcks()
+{
+	vehicle_command_ack_s ack{};
+
+	for (int i = 0; i < vehicle_command_ack_s::ORB_QUEUE_LENGTH && _vehicle_command_ack_sub.update(&ack); ++i) {
+		if (!ack.from_external && ack.target_system == _remote_system
+		    && ack.target_component == _remote_component
+		    && ack.command <= UINT16_MAX) {
+			sendVehicleCommandAck(ack);
+			_relayed_command_acks++;
+		}
+	}
+}
+
 void MylinkBridge::handlePing(const mavlink_message_t &message)
 {
 	mavlink_ping_t ping{};
@@ -239,6 +294,11 @@ void MylinkBridge::handleCommandLong(const mavlink_message_t &message)
 	mavlink_command_long_t command{};
 	mavlink_msg_command_long_decode(&message, &command);
 
+	if (command.command == custom_action_protocol::kMavCmdUser1) {
+		handleCustomActionCommand(message, command);
+		return;
+	}
+
 	if (!targetOk(command.target_system, command.target_component)) {
 		return;
 	}
@@ -249,6 +309,7 @@ void MylinkBridge::handleCommandLong(const mavlink_message_t &message)
 	}
 
 	if (command.command == MAV_CMD_NAV_LAND) {
+		_commander_owns_control = true;
 		publishVehicleCommand(message, command, vehicle_command_s::VEHICLE_CMD_NAV_LAND);
 		_handled_messages++;
 		return;
@@ -265,6 +326,18 @@ void MylinkBridge::handleCommandLong(const mavlink_message_t &message)
 		_unsupported_messages++;
 		return;
 	}
+}
+
+void MylinkBridge::handleCustomActionCommand(const mavlink_message_t &message,
+		const mavlink_command_long_t &command)
+{
+	if (!customTargetOk(command.target_system, command.target_component)) {
+		return;
+	}
+
+	publishVehicleCommand(message, command, custom_action_protocol::kMavCmdUser1);
+	_custom_action_commands++;
+	_handled_messages++;
 }
 
 void MylinkBridge::handleMotorTestCommand(const mavlink_message_t &message,
@@ -498,6 +571,11 @@ bool MylinkBridge::decodeLocalNedSetpoint(const mavlink_message_t &message,
 
 void MylinkBridge::handleSetPositionTargetLocalNed(const mavlink_message_t &message, GateState state)
 {
+	if (!legacyControlAllowed()) {
+		_legacy_setpoints_blocked++;
+		return;
+	}
+
 	// Direct motor control owns the Offboard control type while it is active.
 	// A parallel velocity stream must not switch control allocation back on.
 	if (_direct_motor_active || _direct_motor_stopping) {
@@ -559,6 +637,7 @@ void MylinkBridge::clearSessionState()
 	_last_setpoint_rx = 0;
 	_event_flags = EventNone;
 	_latest_event_command = 0;
+	_commander_owns_control = false;
 	_session_resets++;
 }
 
@@ -589,6 +668,9 @@ void MylinkBridge::processMavlinkMessage(const mavlink_message_t &message)
 
 void MylinkBridge::handleMavlinkMessage(const mavlink_message_t &message)
 {
+	_remote_system = message.sysid;
+	_remote_component = message.compid;
+
 	if (message.msgid == MAVLINK_MSG_ID_PING) {
 		handlePing(message);
 		return;
@@ -597,6 +679,18 @@ void MylinkBridge::handleMavlinkMessage(const mavlink_message_t &message)
 	if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
 		handleHeartbeat(message);
 		return;
+	}
+
+	// CUSTOM1 must receive an explicit rejection even when disarmed. The custom
+	// controller, not this bridge gate, owns its flight-state validation.
+	if (message.msgid == MAVLINK_MSG_ID_COMMAND_LONG) {
+		mavlink_command_long_t command{};
+		mavlink_msg_command_long_decode(&message, &command);
+
+		if (command.command == custom_action_protocol::kMavCmdUser1) {
+			handleCommandLong(message);
+			return;
+		}
 	}
 
 	const GateState state = gateState();
@@ -640,6 +734,7 @@ void MylinkBridge::updateGateAndCachedMessage()
 	}
 
 	_was_armed = armed;
+	_custom_action_status_sub.update(&_custom_action_status);
 
 
 	updateDirectMotorControl(state);
@@ -727,6 +822,7 @@ void MylinkBridge::Run()
 	perf_begin(_loop_perf);
 	perf_count(_loop_interval_perf);
 	updateGateAndCachedMessage();
+	relayVehicleCommandAcks();
 	readSerial();
 	perf_end(_loop_perf);
 }
@@ -807,6 +903,10 @@ int MylinkBridge::print_status()
 		 _offboard_setpoints_received, _offboard_control_mode_published,
 		 _trajectory_setpoints_published, _offboard_mode_requests,
 		 _invalid_setpoints, setpoint_age_ms);
+	PX4_INFO("custom: commands=%" PRIu32 " owner=%u state=%u handover=%u legacy_blocked=%" PRIu32
+		 " ack_relayed=%" PRIu32,
+		 _custom_action_commands, _custom_action_status.control_owner, _custom_action_status.state,
+		 _custom_action_status.handover_id, _legacy_setpoints_blocked, _relayed_command_acks);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,

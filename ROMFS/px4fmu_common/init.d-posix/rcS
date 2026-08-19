@@ -255,6 +255,12 @@ then
 	failure_injection_manager start
 fi
 
+# CUST_TOP_EN only exists when the project SEARCH_TOP module is built.
+if param compare -s CUST_TOP_EN 1
+then
+	custom_action_control start
+fi
+
 if param greater SIM_BAT_DRAIN 0
 then
 	battery_simulator start

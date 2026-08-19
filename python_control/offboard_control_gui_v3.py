@@ -31,6 +31,17 @@ SOURCE_SYSTEM = 42
 SOURCE_COMPONENT = 191
 TARGET_SYSTEM = 1
 TARGET_COMPONENT = 1
+CUSTOM_COMPONENT = 25
+MAV_CMD_CUSTOM_ACTION = mavlink2.MAV_CMD_USER_1
+CUSTOM_ACTION_SEARCH_TOP = 1
+CUSTOM_ACTION_DIRECTION_INTENT = 2
+CUSTOM_ACTION_REBASE_COMPLETE = 3
+CUSTOM_RESULT_STARTED = 1
+CUSTOM_RESULT_BUTTON_CONSUMED = 2
+CUSTOM_RESULT_LEGACY_ALLOWED = 3
+CUSTOM_RESULT_REBASE_ACCEPTED = 4
+CUSTOM_RESULT_HANDOVER_PENDING = 5
+CUSTOM_RESULT_TOP_HOLD = 6
 SETPOINT_RATE_HZ = 10.0
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
@@ -123,6 +134,23 @@ class MyLinkState:
     rx_counts: tuple[tuple[str, int], ...] = ()
     tx_setpoints: int = 0
     error: str = ""
+
+
+@dataclass(frozen=True)
+class CommandAck:
+    command: int
+    result: int
+    result_param2: int
+    source_system: int
+    source_component: int
+
+    @property
+    def project_request_id(self) -> int:
+        return (self.result_param2 >> 8) & 0xFFFF
+
+    @property
+    def project_result(self) -> int:
+        return self.result_param2 & 0xFF
 
 
 @dataclass(frozen=True)
@@ -501,7 +529,7 @@ class MyLinkMavlinkClient:
         self._state_lock = threading.Lock()
         self._state_changed = threading.Condition(self._state_lock)
         self._ack_changed = threading.Condition()
-        self._acks: list[tuple[int, int]] = []
+        self._acks: list[CommandAck] = []
         self._rx_counts: dict[str, int] = {}
         self._state = MyLinkState()
         self._last_heartbeat: float | None = None
@@ -515,6 +543,11 @@ class MyLinkMavlinkClient:
         self._setpoint_count = 0
         self._command_tx_count = 0
         self._heartbeat_tx_count = 0
+        self._legacy_output_allowed = True
+        self._project_request_id = 0
+        self._project_lock = threading.Lock()
+        self._outstanding_project_requests: set[int] = set()
+        self._rebase_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
 
     def start(self, timeout_s: float = 12.0) -> None:
@@ -529,6 +562,7 @@ class MyLinkMavlinkClient:
             force_connected=True,
         )
         self._stop.clear()
+        self._legacy_output_allowed = True
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
@@ -548,6 +582,7 @@ class MyLinkMavlinkClient:
 
     def close(self) -> None:
         self._stop.set()
+        self._legacy_output_allowed = False
         for thread in self._threads:
             thread.join(timeout=1.0)
         self._threads.clear()
@@ -685,14 +720,22 @@ class MyLinkMavlinkClient:
                 raise TimeoutError("等待 Offboard 预热设定值超时")
             time.sleep(0.02)
 
-    def send_command_long(self, command: int, params: list[float], timeout_s: float = 6.0) -> int:
+    def send_command_long(
+        self,
+        command: int,
+        params: list[float],
+        timeout_s: float = 6.0,
+        *,
+        target_component: int | None = None,
+        expected_project_request_id: int | None = None,
+    ) -> CommandAck:
         if len(params) != 7:
             raise ValueError("COMMAND_LONG 必须提供7个参数")
         with self._ack_changed:
             start = len(self._acks)
         message = self._mav.command_long_encode(
             self.target_system,
-            self.target_component,
+            self.target_component if target_component is None else int(target_component),
             int(command),
             0,
             *[float(value) for value in params],
@@ -702,9 +745,17 @@ class MyLinkMavlinkClient:
         deadline = time.monotonic() + timeout_s
         with self._ack_changed:
             while True:
-                for ack_command, result in self._acks[start:]:
-                    if ack_command == command and result != mavlink2.MAV_RESULT_IN_PROGRESS:
-                        return result
+                for ack in self._acks[start:]:
+                    request_matches = (
+                        expected_project_request_id is None
+                        or ack.project_request_id == expected_project_request_id
+                    )
+                    if (
+                        ack.command == command
+                        and request_matches
+                        and ack.result != mavlink2.MAV_RESULT_IN_PROGRESS
+                    ):
+                        return ack
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"COMMAND_ACK timeout command={command}")
@@ -713,11 +764,44 @@ class MyLinkMavlinkClient:
     def command_tx_count(self) -> int:
         return self._command_tx_count
 
+    def next_project_request_id(self) -> int:
+        with self._project_lock:
+            self._project_request_id = (self._project_request_id % 0xFFFF) + 1
+            return self._project_request_id
+
+    def send_project_command(self, action: int, value: float = 0.0) -> CommandAck:
+        request_id = self.next_project_request_id()
+        with self._project_lock:
+            self._outstanding_project_requests.add(request_id)
+        try:
+            return self.send_command_long(
+                MAV_CMD_CUSTOM_ACTION,
+                [float(action), float(value), float(request_id), 0, 0, 0, 0],
+                target_component=CUSTOM_COMPONENT,
+                expected_project_request_id=request_id,
+            )
+        finally:
+            with self._project_lock:
+                self._outstanding_project_requests.discard(request_id)
+
+    def block_legacy_output(self) -> None:
+        self._legacy_output_allowed = False
+
+    def allow_legacy_output(self) -> None:
+        self._legacy_output_allowed = True
+
+    def direction_intent(self, direction_id: int) -> CommandAck:
+        return self.send_project_command(CUSTOM_ACTION_DIRECTION_INTENT, float(direction_id))
+
+    def start_search_top(self) -> CommandAck:
+        return self.send_project_command(CUSTOM_ACTION_SEARCH_TOP)
+
     def land(self) -> int:
+        self.block_legacy_output()
         return self.send_command_long(
             mavlink2.MAV_CMD_NAV_LAND,
             [0, 0, 0, math.nan, math.nan, math.nan, 0],
-        )
+        ).result
 
     def _write(self, message) -> None:
         connection = self._connection
@@ -737,6 +821,9 @@ class MyLinkMavlinkClient:
         self._heartbeat_tx_count += 1
 
     def _send_setpoint(self) -> None:
+        if not self._legacy_output_allowed:
+            return
+
         now = time.monotonic()
         state = self.snapshot()
         actual = (state.x, state.y, state.z)
@@ -916,9 +1003,88 @@ class MyLinkMavlinkClient:
                 )
             self._state_changed.notify_all()
         if name == "COMMAND_ACK":
+            ack = CommandAck(
+                command=int(message.command),
+                result=int(message.result),
+                result_param2=int(getattr(message, "result_param2", 0)),
+                source_system=int(message.get_srcSystem()),
+                source_component=int(message.get_srcComponent()),
+            )
             with self._ack_changed:
-                self._acks.append((int(message.command), int(message.result)))
+                self._acks.append(ack)
                 self._ack_changed.notify_all()
+            self._handle_project_ack(ack)
+
+    def _handle_project_ack(self, ack: CommandAck) -> None:
+        if ack.command != MAV_CMD_CUSTOM_ACTION:
+            return
+
+        result = ack.project_result
+        if result in {
+            CUSTOM_RESULT_STARTED,
+            CUSTOM_RESULT_BUTTON_CONSUMED,
+            CUSTOM_RESULT_HANDOVER_PENDING,
+            CUSTOM_RESULT_TOP_HOLD,
+        }:
+            self.block_legacy_output()
+
+        if result == CUSTOM_RESULT_STARTED:
+            self.log(f"[CUSTOM1] accepted request={ack.project_request_id}; PX4 owns control")
+        elif result == CUSTOM_RESULT_TOP_HOLD:
+            self.log("[TOP_HOLD] PX4 reports top contact; holding contact position")
+        elif result == CUSTOM_RESULT_HANDOVER_PENDING:
+            with self._project_lock:
+                response_to_request = ack.project_request_id in self._outstanding_project_requests
+            if response_to_request:
+                self.log("[HANDOVER] PX4 is already waiting for the current rebase")
+                return
+            self.log(f"[HANDOVER] PX4 requests V3 rebase id={ack.project_request_id}")
+            threading.Thread(
+                target=self._complete_handover,
+                args=(ack.project_request_id,),
+                name="gui-v3-rebase",
+                daemon=True,
+            ).start()
+        elif result == CUSTOM_RESULT_REBASE_ACCEPTED:
+            self.allow_legacy_output()
+
+    def _complete_handover(self, handover_id: int) -> bool:
+        if not self._rebase_lock.acquire(blocking=False):
+            return False
+
+        try:
+            state = self.wait_until(
+                lambda item: (
+                    None not in (item.x, item.y, item.z)
+                    and item.local_position_age_s is not None
+                    and item.local_position_age_s <= 0.5
+                ),
+                3.0,
+                "fresh LOCAL_POSITION_NED for CUSTOM handover",
+            )
+            actual = (float(state.x), float(state.y), float(state.z))
+            self.reset_trajectory(actual, announce=True, stream_mode=state.mode)
+            self.block_legacy_output()
+            ack = self.send_project_command(CUSTOM_ACTION_REBASE_COMPLETE, float(handover_id))
+            accepted = (
+                ack.result == mavlink2.MAV_RESULT_ACCEPTED
+                and ack.project_result == CUSTOM_RESULT_REBASE_ACCEPTED
+            )
+            if not accepted:
+                raise RuntimeError(
+                    f"rebase rejected result={ack.result} project={ack.project_result}"
+                )
+            self.allow_legacy_output()
+            self.log(
+                f"[HANDOVER] rebase complete id={handover_id}; "
+                f"legacy target=N{actual[0]:.3f} E{actual[1]:.3f} D{actual[2]:.3f}"
+            )
+            return True
+        except Exception as exc:
+            self.log(f"[ERROR] CUSTOM handover remains blocked: {exc}")
+            return False
+        finally:
+            self._rebase_lock.release()
 
 
 class EventLog:
@@ -998,6 +1164,7 @@ class MyLinkController:
             self._last_mode = state.mode.upper()
             self._landing_requested = False
             client.reset_trajectory(self.origin, stream_mode=state.mode)
+            client.allow_legacy_output()
             client.start_setpoints()
             self.log.write(f"[OK] Origin NED={self.origin}; Local-NED stream 10 Hz started")
         except Exception:
@@ -1048,7 +1215,9 @@ class MyLinkController:
         if mode != "OFFBOARD" or entering:
             actual = (float(state.x), float(state.y), float(state.z))
             self.origin = self.origin or actual
-            self.require_client().reset_trajectory(actual, stream_mode=mode)
+            client = self.require_client()
+            client.reset_trajectory(actual, stream_mode=mode)
+            client.allow_legacy_output()
             if entering:
                 self._landing_requested = False
                 self.log.write(
@@ -1107,6 +1276,8 @@ class MyLinkController:
         if client.takeoff_active():
             self.log.write("[IGNORED] DESCEND: TAKEOFF trajectory is active")
             return
+        if not self._legacy_direction_allowed(client, "DOWN"):
+            return
         old, new = client.offset_final_target((0.0, 0.0, value))
         self._log_target_change("DESCEND", old, new)
 
@@ -1128,6 +1299,8 @@ class MyLinkController:
         }
         if direction not in delta:
             raise ValueError(f"unknown direction {direction}")
+        if not self._legacy_direction_allowed(client, direction):
+            return
         old, new = client.offset_final_target(delta[direction])
         self._log_target_change(direction, old, new)
 
@@ -1141,8 +1314,56 @@ class MyLinkController:
         self.log.write(f"[TARGET] old final target: N={old[0]:.3f} E={old[1]:.3f} D={old[2]:.3f}")
         self.log.write(f"[TARGET] new final target: N={new[0]:.3f} E={new[1]:.3f} D={new[2]:.3f}")
 
+    def _legacy_direction_allowed(self, client: MyLinkMavlinkClient, direction: str) -> bool:
+        direction_ids = {
+            "FORWARD": 1,
+            "BACK": 2,
+            "LEFT": 3,
+            "RIGHT": 4,
+            "UP": 5,
+            "DOWN": 6,
+        }
+        ack = client.direction_intent(direction_ids[direction])
+        self.command_result(f"{direction} INTENT", ack.result)
+
+        if (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_LEGACY_ALLOWED
+        ):
+            return True
+
+        if (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_BUTTON_CONSUMED
+        ):
+            self.log.write(
+                f"[CUSTOM] first {direction} only cancels CUSTOM; movement not executed"
+            )
+            client._complete_handover(ack.project_request_id)
+            return False
+
+        self.log.write(
+            f"[IGNORED] {direction}: PX4 project_result={ack.project_result}; no target change"
+        )
+        return False
+
     def custom(self) -> None:
-        self.log.write("[CUSTOM] CUSTOM mode reserved / 尚未定义")
+        client = self._require_offboard("CUSTOM1 SEARCH_TOP")
+        if client is None:
+            return
+        if client.takeoff_active():
+            self.log.write("[IGNORED] CUSTOM1: TAKEOFF trajectory is active")
+            return
+        self.log.write("[CUSTOM1] command sent once")
+        ack = client.start_search_top()
+        self.command_result("CUSTOM1 SEARCH_TOP", ack.result)
+        if not (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_STARTED
+        ):
+            self.log.write(
+                f"[CUSTOM1] rejected project_result={ack.project_result}; legacy control unchanged"
+            )
 
     def land(self) -> int:
         self._landing_requested = True
@@ -1379,8 +1600,13 @@ def self_test() -> None:
     generator.reset((0.0, 0.0, 0.0))
     generator.offset_final_target((0.5, 0.0, 0.0))
     first = generator.update((0.0, 0.0, 0.0), 0.1)
-    assert math.isclose(first.command_position[0], 0.003, abs_tol=1e-9)
+    # XY position is masked during velocity movement, so the diagnostic
+    # position carries final_target while velocity is acceleration-limited.
+    assert math.isclose(first.command_position[0], 0.5, abs_tol=1e-9)
     assert math.isclose(first.command_velocity[0], 0.03, abs_tol=1e-9)
+    ack = CommandAck(MAV_CMD_CUSTOM_ACTION, 0, (123 << 8) | CUSTOM_RESULT_STARTED, 1, 25)
+    assert ack.project_request_id == 123
+    assert ack.project_result == CUSTOM_RESULT_STARTED
     controller_names = set(dir(MyLinkController))
     assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
     source = Path(__file__).read_text(encoding="utf-8").split("def self_test()", 1)[0]
@@ -1392,7 +1618,8 @@ def self_test() -> None:
     assert "MAV_CMD_COMPONENT_ARM_DISARM" not in source
     assert "MAV_CMD_DO_SET_MODE" not in source
     assert "DEFAULT_CONNECTION" in source
-    print("GUI V3 self-test: UDP stream-only API OK; no ARM/DISARM/OFFBOARD command; no connection opened")
+    assert "CUSTOM_ACTION_REBASE_COMPLETE" in source
+    print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")
 
 
 def main() -> None:

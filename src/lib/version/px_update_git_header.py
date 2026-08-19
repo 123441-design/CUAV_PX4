@@ -130,9 +130,11 @@ if (os.path.exists('src/modules/mavlink/mavlink/.git')):
 if (os.path.exists('platforms/nuttx/NuttX/nuttx/.git')):
     nuttx_git_tags = subprocess.check_output('git -c versionsort.suffix=- tag --sort=v:refname'.split(),
                                   cwd='platforms/nuttx/NuttX/nuttx', stderr=subprocess.STDOUT).decode('utf-8').strip()
-    # may be empty if shallow clone
-    if (len(nuttx_git_tags) > 0):
-        nuttx_git_tag = re.findall(r'nuttx-[0-9]+\.[0-9]+\.[0-9]+', nuttx_git_tags)[-1].replace("nuttx-", "v")
+    # May be empty in a shallow clone, or may contain only parent-repository
+    # tags when a vendor tree carries NuttX in-tree.
+    matching_nuttx_tags = re.findall(r'nuttx-[0-9]+\.[0-9]+\.[0-9]+', nuttx_git_tags)
+    if matching_nuttx_tags:
+        nuttx_git_tag = matching_nuttx_tags[-1].replace("nuttx-", "v")
         nuttx_git_tag = re.sub('-.*', '.0', nuttx_git_tag)
     else:
         nuttx_git_tag = "v0.0.0"

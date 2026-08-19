@@ -56,6 +56,7 @@ set(msg_files
 	CellularStatus.msg
 	CollisionConstraints.msg
 	ControlAllocatorStatus.msg
+	CustomActionStatus.msg
 	Cpuload.msg
 	DatamanRequest.msg
 	DatamanResponse.msg
@@ -226,6 +227,7 @@ set(msg_files
 	TelemetryStatus.msg
 	TiltrotorExtraControls.msg
 	TimesyncStatus.msg
+	TopContact.msg
 	TrajectorySetpoint6dof.msg
 	TransponderReport.msg
 	TuneControl.msg

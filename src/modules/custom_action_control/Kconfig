@@ -1,0 +1,5 @@
+menuconfig MODULES_CUSTOM_ACTION_CONTROL
+	bool "custom_action_control"
+	default n
+	---help---
+		Enable the project SEARCH_TOP controller and legacy-control handover.

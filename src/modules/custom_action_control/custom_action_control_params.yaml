@@ -1,0 +1,65 @@
+module_name: custom_action_control
+parameters:
+  - group: Custom Action
+    definitions:
+      CUST_TOP_EN:
+        description:
+          short: Enable SEARCH_TOP controller
+        type: boolean
+        default: 1
+        reboot_required: true
+      CUST_TOP_VEL:
+        description:
+          short: SEARCH_TOP upward speed
+        type: float
+        unit: m/s
+        min: 0.05
+        max: 0.30
+        default: 0.15
+        decimal: 2
+      CUST_TOP_DIST:
+        description:
+          short: Maximum SEARCH_TOP upward distance
+        type: float
+        unit: m
+        min: 0.10
+        max: 3.00
+        default: 1.00
+        decimal: 2
+      CUST_TOP_TIME:
+        description:
+          short: Maximum SEARCH_TOP duration
+        type: float
+        unit: s
+        min: 1.0
+        max: 30.0
+        default: 10.0
+        decimal: 1
+      CUST_TOP_DBNC:
+        description:
+          short: Required continuous top-contact time
+        type: float
+        unit: s
+        min: 0.02
+        max: 0.50
+        default: 0.08
+        decimal: 2
+      CUST_SENS_TO:
+        description:
+          short: Top-contact data timeout
+        type: float
+        unit: s
+        min: 0.10
+        max: 2.00
+        default: 0.50
+        decimal: 2
+      CUST_HO_TIME:
+        description:
+          short: Handover HOLD output timeout
+          long: After this timeout the handover remains blocked, but internal Offboard output stops so normal Offboard-loss can occur if V3 is absent.
+        type: float
+        unit: s
+        min: 1.0
+        max: 10.0
+        default: 3.0
+        decimal: 1
