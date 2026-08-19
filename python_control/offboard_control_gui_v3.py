@@ -57,6 +57,10 @@ POSITION_VELOCITY_MASK = (
     | mavlink2.POSITION_TARGET_TYPEMASK_YAW_IGNORE
     | mavlink2.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
 )
+TAKEOFF_POSITION_VELOCITY_MASK = (
+    POSITION_VELOCITY_MASK
+    & ~mavlink2.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+)
 HORIZONTAL_VELOCITY_MASK = (
     POSITION_VELOCITY_MASK
     | mavlink2.POSITION_TARGET_TYPEMASK_X_IGNORE
@@ -130,6 +134,7 @@ class TrajectoryState:
     arrived: bool
     takeoff_state: "TakeoffState"
     horizontal_position_hold: bool
+    takeoff_yaw: float | None
 
 
 class TakeoffState(str, Enum):
@@ -181,6 +186,7 @@ class SetpointTrajectoryGenerator:
         self._takeoff_start_z = 0.0
         self._takeoff_liftoff_z = 0.0
         self._xy_position_hold = True
+        self._takeoff_yaw: float | None = None
 
     @staticmethod
     def _finite_position(position: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -219,6 +225,7 @@ class SetpointTrajectoryGenerator:
         self._command_acceleration = (0.0, 0.0, 0.0)
         self._takeoff_state = TakeoffState.IDLE
         self._xy_position_hold = True
+        self._takeoff_yaw = None
         return self.snapshot()
 
     def set_final_target(self, target: tuple[float, float, float]) -> TrajectoryState:
@@ -228,17 +235,22 @@ class SetpointTrajectoryGenerator:
         self._final_target = target
         self._takeoff_state = TakeoffState.IDLE
         self._xy_position_hold = True
+        self._takeoff_yaw = None
         return self.snapshot()
 
     def start_takeoff(
         self,
         actual_position: tuple[float, float, float],
         altitude: float,
+        yaw: float,
     ) -> TrajectoryState:
         actual = self._finite_position(actual_position)
         altitude = float(altitude)
         if not math.isfinite(altitude) or altitude <= 0.0:
             raise ValueError("takeoff altitude must be finite and positive")
+        yaw = float(yaw)
+        if not math.isfinite(yaw):
+            raise ValueError("takeoff yaw must be finite")
 
         self._initialized = True
         self._takeoff_start_z = actual[2]
@@ -253,6 +265,7 @@ class SetpointTrajectoryGenerator:
         self._command_acceleration = (0.0, 0.0, 0.0)
         self._takeoff_state = TakeoffState.LIFTOFF
         self._xy_position_hold = True
+        self._takeoff_yaw = yaw
         return self.snapshot()
 
     def offset_final_target(
@@ -264,6 +277,7 @@ class SetpointTrajectoryGenerator:
         new = tuple(value + change for value, change in zip(old, delta))
         self._final_target = new
         self._takeoff_state = TakeoffState.IDLE
+        self._takeoff_yaw = None
         if abs(delta[0]) > 1e-9 or abs(delta[1]) > 1e-9:
             self._xy_position_hold = False
         return old, new
@@ -286,6 +300,7 @@ class SetpointTrajectoryGenerator:
             ),
             takeoff_state=self._takeoff_state,
             horizontal_position_hold=self._xy_position_hold,
+            takeoff_yaw=self._takeoff_yaw,
         )
 
     def takeoff_active(self) -> bool:
@@ -495,6 +510,7 @@ class MyLinkMavlinkClient:
         self._trajectory = SetpointTrajectoryGenerator()
         self._last_setpoint_time: float | None = None
         self._last_stream_mode: str | None = None
+        self._offboard_yaw_ref: float | None = None
         self._setpoints_enabled = False
         self._setpoint_count = 0
         self._command_tx_count = 0
@@ -599,6 +615,8 @@ class MyLinkMavlinkClient:
             self._last_setpoint_time = None
             if stream_mode is not None:
                 self._last_stream_mode = stream_mode.upper()
+                if self._last_stream_mode != "OFFBOARD":
+                    self._offboard_yaw_ref = None
         if announce:
             self.log(
                 f"[TARGET] reset N={position[0]:.3f} E={position[1]:.3f} D={position[2]:.3f}"
@@ -632,7 +650,13 @@ class MyLinkMavlinkClient:
         altitude: float,
     ) -> TrajectoryState:
         with self._trajectory_lock:
-            state = self._trajectory.start_takeoff(actual_position, altitude)
+            if self._offboard_yaw_ref is None:
+                raise ValueError("起飞前没有有效航向，拒绝发送起飞设定值")
+            state = self._trajectory.start_takeoff(
+                actual_position,
+                altitude,
+                self._offboard_yaw_ref,
+            )
             self._last_setpoint_time = None
             self._last_stream_mode = "OFFBOARD"
             return state
@@ -722,6 +746,12 @@ class MyLinkMavlinkClient:
         mode = state.mode.upper()
         with self._trajectory_lock:
             entering_offboard = self._last_stream_mode != "OFFBOARD" and mode == "OFFBOARD"
+            if mode != "OFFBOARD":
+                self._offboard_yaw_ref = None
+            elif self._trajectory.snapshot().takeoff_yaw is None:
+                yaw = state.yaw
+                if yaw is not None and math.isfinite(float(yaw)):
+                    self._offboard_yaw_ref = float(yaw)
             if mode != "OFFBOARD" or entering_offboard:
                 self._trajectory.reset(actual_position)
             nominal_dt = 1.0 / self.setpoint_rate_hz
@@ -742,11 +772,17 @@ class MyLinkMavlinkClient:
         x, y, z = generated.command_position
         vx, vy, vz = generated.command_velocity
         ax, ay, az = generated.command_acceleration
-        type_mask = (
-            POSITION_VELOCITY_MASK
-            if generated.horizontal_position_hold
-            else HORIZONTAL_VELOCITY_ACCEL_MASK
-        )
+        takeoff_yaw = generated.takeoff_yaw
+        if takeoff_yaw is not None:
+            type_mask = TAKEOFF_POSITION_VELOCITY_MASK
+            yaw = takeoff_yaw
+        else:
+            type_mask = (
+                POSITION_VELOCITY_MASK
+                if generated.horizontal_position_hold
+                else HORIZONTAL_VELOCITY_ACCEL_MASK
+            )
+            yaw = 0.0
         seq = self._setpoint_count + 1
         self._write(self._mav.set_position_target_local_ned_encode(
             int(now * 1000) & 0xFFFFFFFF,
@@ -763,8 +799,8 @@ class MyLinkMavlinkClient:
             ax,
             ay,
             0,
-            0,
-            0,
+            yaw,
+            0.0,
         ))
         self._setpoint_count = seq
         actual_velocity = (state.vx, state.vy, state.vz)
