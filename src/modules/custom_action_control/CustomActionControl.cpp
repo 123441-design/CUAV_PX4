@@ -22,6 +22,7 @@ namespace
 constexpr hrt_abstime kRunInterval = 20_ms;
 constexpr hrt_abstime kLocalPositionTimeout = 500_ms;
 constexpr hrt_abstime kStatusInterval = 500_ms;
+constexpr uint8_t kRequiredContactSamples = 4;
 
 const char *reasonName(uint8_t reason)
 {
@@ -139,7 +140,8 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	_start_z = _hold_z;
 	_heading_reset_counter = _local_position.heading_reset_counter;
 	_search_started = now;
-	_contact_started = 0;
+	_last_top_contact_timestamp = _top_contact.timestamp;
+	_contact_confirm_count = 0;
 	_handover_started = 0;
 	PX4_INFO("[SEARCH_TOP] entered xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z, (double)_locked_yaw);
@@ -161,7 +163,7 @@ void CustomActionControl::beginHandover(uint8_t reason, uint16_t handover_id,
 	_reason = reason;
 	_handover_id = handover_id == 0 ? 1 : handover_id;
 	_handover_started = hrt_absolute_time();
-	_contact_started = 0;
+	_contact_confirm_count = 0;
 	PX4_WARN("[CUSTOM] handover id=%u reason=%s(%u) hold=(%.2f, %.2f, %.2f)",
 		 _handover_id, reasonName(reason), reason,
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z);
@@ -195,6 +197,25 @@ void CustomActionControl::handleDirectionIntent(const vehicle_command_s &command
 		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
 			   static_cast<uint8_t>(Result::None));
 	}
+}
+
+void CustomActionControl::handleSimulateContact(const vehicle_command_s &command, uint16_t request_id)
+{
+	if (_owner != custom_action_status_s::OWNER_CUSTOM
+	    || _state != custom_action_status_s::STATE_SEARCH_TOP
+	    || !flightStateAllowsCustom()) {
+		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
+			   static_cast<uint8_t>(Result::None));
+		return;
+	}
+
+	// TEST ONLY: updateTestContact() will publish fresh contact=true samples at
+	// the module's 50 Hz cycle. The normal four-sample confirmation still
+	// applies, so this path exercises the same debounce logic as the real input.
+	_test_contact_mode.store(1);
+	publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
+		   static_cast<uint8_t>(Result::ContactSignalAccepted));
+	(void)request_id;
 }
 
 void CustomActionControl::handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id)
@@ -250,6 +271,10 @@ void CustomActionControl::handleCommand(const vehicle_command_s &command)
 		handleRebaseComplete(command, request_id);
 		break;
 
+	case Command::SimulateContact:
+		handleSimulateContact(command, request_id);
+		break;
+
 	default:
 		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_UNSUPPORTED,
 			   static_cast<uint8_t>(Result::None));
@@ -268,6 +293,8 @@ void CustomActionControl::enterTopHold()
 	_state = custom_action_status_s::STATE_TOP_HOLD;
 	_owner = custom_action_status_s::OWNER_CUSTOM;
 	_reason = custom_action_status_s::REASON_TOP_CONTACT;
+	_test_contact_mode.store(-1);
+	_contact_confirm_count = 0;
 	PX4_INFO("[SEARCH_TOP] top sensor triggered");
 	PX4_INFO("[TOP_HOLD] entered z=%.2f", (double)_hold_z);
 	publishStatus(true);
@@ -284,7 +311,8 @@ void CustomActionControl::releaseToLegacy(uint8_t reason)
 	_handover_id = 0;
 	_search_started = 0;
 	_handover_started = 0;
-	_contact_started = 0;
+	_contact_confirm_count = 0;
+	_test_contact_mode.store(-1);
 	publishStatus(true);
 }
 
@@ -296,7 +324,8 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 	_handover_id = 0;
 	_search_started = 0;
 	_handover_started = 0;
-	_contact_started = 0;
+	_contact_confirm_count = 0;
+	_test_contact_mode.store(-1);
 	PX4_INFO("[CUSTOM] control released to Commander: %s", reasonName(reason));
 	publishStatus(true);
 }
@@ -376,7 +405,7 @@ void CustomActionControl::Run()
 	updateTestContact(now);
 	_vehicle_local_position_sub.update(&_local_position);
 	_vehicle_status_sub.update(&_vehicle_status);
-	_top_contact_sub.update(&_top_contact);
+	const bool top_contact_updated = _top_contact_sub.update(&_top_contact);
 
 	vehicle_command_s command{};
 
@@ -423,17 +452,23 @@ void CustomActionControl::Run()
 			beginHandover(custom_action_status_s::REASON_TIMEOUT, _active_request_id,
 				      _active_source_system, _active_source_component, true);
 
-		} else if (_top_contact.contact) {
-			if (_contact_started == 0) {
-				_contact_started = now;
+		} else if (top_contact_updated) {
+			// Count only fresh, timestamp-advancing samples. A single contact
+			// packet is only a candidate; four consecutive valid samples are
+			// required before declaring TOP_HOLD.
+			if (_top_contact.timestamp <= _last_top_contact_timestamp
+			    || !_top_contact.valid || !_top_contact.contact) {
+				_contact_confirm_count = 0;
+
+			} else {
+				_last_top_contact_timestamp = _top_contact.timestamp;
+				_contact_confirm_count++;
+
+				if (_contact_confirm_count >= kRequiredContactSamples) {
+					enterTopHold();
+				}
 			}
 
-			if (now - _contact_started >= static_cast<hrt_abstime>(_param_top_debounce.get() * 1_s)) {
-				enterTopHold();
-			}
-
-		} else {
-			_contact_started = 0;
 		}
 	}
 

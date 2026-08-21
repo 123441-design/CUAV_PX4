@@ -43,6 +43,7 @@ private:
 	void startSearchTop(const vehicle_command_s &command, uint16_t request_id);
 	void handleDirectionIntent(const vehicle_command_s &command, uint16_t request_id);
 	void handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id);
+	void handleSimulateContact(const vehicle_command_s &command, uint16_t request_id);
 	void enterTopHold();
 	void beginHandover(uint8_t reason, uint16_t handover_id, uint8_t target_system,
 			   uint16_t target_component, bool notify_pending);
@@ -89,7 +90,8 @@ private:
 	float _start_z{0.f};
 	uint8_t _heading_reset_counter{0};
 	hrt_abstime _search_started{0};
-	hrt_abstime _contact_started{0};
+	uint64_t _last_top_contact_timestamp{0};
+	uint8_t _contact_confirm_count{0};
 	hrt_abstime _handover_started{0};
 	hrt_abstime _last_status_publish{0};
 
@@ -100,7 +102,6 @@ private:
 		(ParamFloat<px4::params::CUST_TOP_VEL>) _param_top_velocity,
 		(ParamFloat<px4::params::CUST_TOP_DIST>) _param_top_distance,
 		(ParamFloat<px4::params::CUST_TOP_TIME>) _param_top_time,
-		(ParamFloat<px4::params::CUST_TOP_DBNC>) _param_top_debounce,
 		(ParamFloat<px4::params::CUST_SENS_TO>) _param_sensor_timeout,
 		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout
 	)

@@ -15,6 +15,7 @@ enum class Command : uint8_t {
 	SearchTop = 1,
 	DirectionIntent = 2,
 	RebaseComplete = 3,
+	SimulateContact = 4,
 };
 
 enum class Direction : uint8_t {
@@ -34,6 +35,7 @@ enum class Result : uint8_t {
 	RebaseAccepted = 4,
 	HandoverPending = 5,
 	TopHoldEntered = 6,
+	ContactSignalAccepted = 7,
 };
 
 constexpr int32_t encodeResult(uint16_t request_id, Result result)

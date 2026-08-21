@@ -31,6 +31,18 @@ SOURCE_SYSTEM = 42
 SOURCE_COMPONENT = 191
 TARGET_SYSTEM = 1
 TARGET_COMPONENT = 1
+CUSTOM_COMPONENT = 25
+MAV_CMD_CUSTOM_ACTION = mavlink2.MAV_CMD_USER_1
+CUSTOM_ACTION_SEARCH_TOP = 1
+CUSTOM_ACTION_DIRECTION_INTENT = 2
+CUSTOM_ACTION_REBASE_COMPLETE = 3
+CUSTOM_ACTION_SIMULATE_CONTACT = 4
+CUSTOM_RESULT_STARTED = 1
+CUSTOM_RESULT_BUTTON_CONSUMED = 2
+CUSTOM_RESULT_LEGACY_ALLOWED = 3
+CUSTOM_RESULT_REBASE_ACCEPTED = 4
+CUSTOM_RESULT_HANDOVER_PENDING = 5
+CUSTOM_RESULT_TOP_HOLD = 6
 SETPOINT_RATE_HZ = 10.0
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
@@ -56,6 +68,10 @@ POSITION_VELOCITY_MASK = (
     | mavlink2.POSITION_TARGET_TYPEMASK_AZ_IGNORE
     | mavlink2.POSITION_TARGET_TYPEMASK_YAW_IGNORE
     | mavlink2.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+)
+TAKEOFF_POSITION_VELOCITY_MASK = (
+    POSITION_VELOCITY_MASK
+    & ~mavlink2.POSITION_TARGET_TYPEMASK_YAW_IGNORE
 )
 HORIZONTAL_VELOCITY_MASK = (
     POSITION_VELOCITY_MASK
@@ -122,6 +138,23 @@ class MyLinkState:
 
 
 @dataclass(frozen=True)
+class CommandAck:
+    command: int
+    result: int
+    result_param2: int
+    source_system: int
+    source_component: int
+
+    @property
+    def project_request_id(self) -> int:
+        return (self.result_param2 >> 8) & 0xFFFF
+
+    @property
+    def project_result(self) -> int:
+        return self.result_param2 & 0xFF
+
+
+@dataclass(frozen=True)
 class TrajectoryState:
     final_target: tuple[float, float, float]
     command_position: tuple[float, float, float]
@@ -130,6 +163,7 @@ class TrajectoryState:
     arrived: bool
     takeoff_state: "TakeoffState"
     horizontal_position_hold: bool
+    takeoff_yaw: float | None
 
 
 class TakeoffState(str, Enum):
@@ -181,6 +215,7 @@ class SetpointTrajectoryGenerator:
         self._takeoff_start_z = 0.0
         self._takeoff_liftoff_z = 0.0
         self._xy_position_hold = True
+        self._takeoff_yaw: float | None = None
 
     @staticmethod
     def _finite_position(position: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -219,6 +254,7 @@ class SetpointTrajectoryGenerator:
         self._command_acceleration = (0.0, 0.0, 0.0)
         self._takeoff_state = TakeoffState.IDLE
         self._xy_position_hold = True
+        self._takeoff_yaw = None
         return self.snapshot()
 
     def set_final_target(self, target: tuple[float, float, float]) -> TrajectoryState:
@@ -228,17 +264,22 @@ class SetpointTrajectoryGenerator:
         self._final_target = target
         self._takeoff_state = TakeoffState.IDLE
         self._xy_position_hold = True
+        self._takeoff_yaw = None
         return self.snapshot()
 
     def start_takeoff(
         self,
         actual_position: tuple[float, float, float],
         altitude: float,
+        yaw: float,
     ) -> TrajectoryState:
         actual = self._finite_position(actual_position)
         altitude = float(altitude)
         if not math.isfinite(altitude) or altitude <= 0.0:
             raise ValueError("takeoff altitude must be finite and positive")
+        yaw = float(yaw)
+        if not math.isfinite(yaw):
+            raise ValueError("takeoff yaw must be finite")
 
         self._initialized = True
         self._takeoff_start_z = actual[2]
@@ -253,6 +294,7 @@ class SetpointTrajectoryGenerator:
         self._command_acceleration = (0.0, 0.0, 0.0)
         self._takeoff_state = TakeoffState.LIFTOFF
         self._xy_position_hold = True
+        self._takeoff_yaw = yaw
         return self.snapshot()
 
     def offset_final_target(
@@ -264,6 +306,7 @@ class SetpointTrajectoryGenerator:
         new = tuple(value + change for value, change in zip(old, delta))
         self._final_target = new
         self._takeoff_state = TakeoffState.IDLE
+        self._takeoff_yaw = None
         if abs(delta[0]) > 1e-9 or abs(delta[1]) > 1e-9:
             self._xy_position_hold = False
         return old, new
@@ -286,6 +329,7 @@ class SetpointTrajectoryGenerator:
             ),
             takeoff_state=self._takeoff_state,
             horizontal_position_hold=self._xy_position_hold,
+            takeoff_yaw=self._takeoff_yaw,
         )
 
     def takeoff_active(self) -> bool:
@@ -486,7 +530,7 @@ class MyLinkMavlinkClient:
         self._state_lock = threading.Lock()
         self._state_changed = threading.Condition(self._state_lock)
         self._ack_changed = threading.Condition()
-        self._acks: list[tuple[int, int]] = []
+        self._acks: list[CommandAck] = []
         self._rx_counts: dict[str, int] = {}
         self._state = MyLinkState()
         self._last_heartbeat: float | None = None
@@ -495,11 +539,18 @@ class MyLinkMavlinkClient:
         self._trajectory = SetpointTrajectoryGenerator()
         self._last_setpoint_time: float | None = None
         self._last_stream_mode: str | None = None
+        self._offboard_yaw_ref: float | None = None
         self._setpoints_enabled = False
         self._setpoint_count = 0
         self._command_tx_count = 0
         self._heartbeat_tx_count = 0
+        self._legacy_output_allowed = True
+        self._project_request_id = 0
+        self._project_lock = threading.Lock()
+        self._outstanding_project_requests: set[int] = set()
+        self._rebase_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
+        self._search_top_active = False
 
     def start(self, timeout_s: float = 12.0) -> None:
         if self._connection is not None:
@@ -513,6 +564,8 @@ class MyLinkMavlinkClient:
             force_connected=True,
         )
         self._stop.clear()
+        self._legacy_output_allowed = True
+        self._search_top_active = False
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
@@ -532,6 +585,8 @@ class MyLinkMavlinkClient:
 
     def close(self) -> None:
         self._stop.set()
+        self._legacy_output_allowed = False
+        self._search_top_active = False
         for thread in self._threads:
             thread.join(timeout=1.0)
         self._threads.clear()
@@ -599,6 +654,8 @@ class MyLinkMavlinkClient:
             self._last_setpoint_time = None
             if stream_mode is not None:
                 self._last_stream_mode = stream_mode.upper()
+                if self._last_stream_mode != "OFFBOARD":
+                    self._offboard_yaw_ref = None
         if announce:
             self.log(
                 f"[TARGET] reset N={position[0]:.3f} E={position[1]:.3f} D={position[2]:.3f}"
@@ -632,7 +689,13 @@ class MyLinkMavlinkClient:
         altitude: float,
     ) -> TrajectoryState:
         with self._trajectory_lock:
-            state = self._trajectory.start_takeoff(actual_position, altitude)
+            if self._offboard_yaw_ref is None:
+                raise ValueError("起飞前没有有效航向，拒绝发送起飞设定值")
+            state = self._trajectory.start_takeoff(
+                actual_position,
+                altitude,
+                self._offboard_yaw_ref,
+            )
             self._last_setpoint_time = None
             self._last_stream_mode = "OFFBOARD"
             return state
@@ -661,14 +724,22 @@ class MyLinkMavlinkClient:
                 raise TimeoutError("等待 Offboard 预热设定值超时")
             time.sleep(0.02)
 
-    def send_command_long(self, command: int, params: list[float], timeout_s: float = 6.0) -> int:
+    def send_command_long(
+        self,
+        command: int,
+        params: list[float],
+        timeout_s: float = 6.0,
+        *,
+        target_component: int | None = None,
+        expected_project_request_id: int | None = None,
+    ) -> CommandAck:
         if len(params) != 7:
             raise ValueError("COMMAND_LONG 必须提供7个参数")
         with self._ack_changed:
             start = len(self._acks)
         message = self._mav.command_long_encode(
             self.target_system,
-            self.target_component,
+            self.target_component if target_component is None else int(target_component),
             int(command),
             0,
             *[float(value) for value in params],
@@ -678,9 +749,17 @@ class MyLinkMavlinkClient:
         deadline = time.monotonic() + timeout_s
         with self._ack_changed:
             while True:
-                for ack_command, result in self._acks[start:]:
-                    if ack_command == command and result != mavlink2.MAV_RESULT_IN_PROGRESS:
-                        return result
+                for ack in self._acks[start:]:
+                    request_matches = (
+                        expected_project_request_id is None
+                        or ack.project_request_id == expected_project_request_id
+                    )
+                    if (
+                        ack.command == command
+                        and request_matches
+                        and ack.result != mavlink2.MAV_RESULT_IN_PROGRESS
+                    ):
+                        return ack
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"COMMAND_ACK timeout command={command}")
@@ -689,11 +768,55 @@ class MyLinkMavlinkClient:
     def command_tx_count(self) -> int:
         return self._command_tx_count
 
+    def next_project_request_id(self) -> int:
+        with self._project_lock:
+            self._project_request_id = (self._project_request_id % 0xFFFF) + 1
+            return self._project_request_id
+
+    def send_project_command(self, action: int, value: float = 0.0) -> CommandAck:
+        request_id = self.next_project_request_id()
+        with self._project_lock:
+            self._outstanding_project_requests.add(request_id)
+        try:
+            return self.send_command_long(
+                MAV_CMD_CUSTOM_ACTION,
+                [float(action), float(value), float(request_id), 0, 0, 0, 0],
+                target_component=CUSTOM_COMPONENT,
+                expected_project_request_id=request_id,
+            )
+        finally:
+            with self._project_lock:
+                self._outstanding_project_requests.discard(request_id)
+
+    def block_legacy_output(self) -> None:
+        self._legacy_output_allowed = False
+
+    def allow_legacy_output(self) -> None:
+        self._legacy_output_allowed = True
+
+    def direction_intent(self, direction_id: int) -> CommandAck:
+        return self.send_project_command(CUSTOM_ACTION_DIRECTION_INTENT, float(direction_id))
+
+    def start_search_top(self) -> CommandAck:
+        return self.send_project_command(CUSTOM_ACTION_SEARCH_TOP)
+
+    def simulate_contact(self) -> CommandAck:
+        if not self._search_top_active:
+            raise RuntimeError("模拟激光信号仅可在寻顶模式运行期间发送")
+        return self.send_project_command(CUSTOM_ACTION_SIMULATE_CONTACT, 1.0)
+
+    def search_top_active(self) -> bool:
+        return self._search_top_active
+
+    def clear_search_top_active(self) -> None:
+        self._search_top_active = False
+
     def land(self) -> int:
+        self.block_legacy_output()
         return self.send_command_long(
             mavlink2.MAV_CMD_NAV_LAND,
             [0, 0, 0, math.nan, math.nan, math.nan, 0],
-        )
+        ).result
 
     def _write(self, message) -> None:
         connection = self._connection
@@ -713,6 +836,9 @@ class MyLinkMavlinkClient:
         self._heartbeat_tx_count += 1
 
     def _send_setpoint(self) -> None:
+        if not self._legacy_output_allowed:
+            return
+
         now = time.monotonic()
         state = self.snapshot()
         actual = (state.x, state.y, state.z)
@@ -722,6 +848,12 @@ class MyLinkMavlinkClient:
         mode = state.mode.upper()
         with self._trajectory_lock:
             entering_offboard = self._last_stream_mode != "OFFBOARD" and mode == "OFFBOARD"
+            if mode != "OFFBOARD":
+                self._offboard_yaw_ref = None
+            elif self._trajectory.snapshot().takeoff_yaw is None:
+                yaw = state.yaw
+                if yaw is not None and math.isfinite(float(yaw)):
+                    self._offboard_yaw_ref = float(yaw)
             if mode != "OFFBOARD" or entering_offboard:
                 self._trajectory.reset(actual_position)
             nominal_dt = 1.0 / self.setpoint_rate_hz
@@ -742,11 +874,17 @@ class MyLinkMavlinkClient:
         x, y, z = generated.command_position
         vx, vy, vz = generated.command_velocity
         ax, ay, az = generated.command_acceleration
-        type_mask = (
-            POSITION_VELOCITY_MASK
-            if generated.horizontal_position_hold
-            else HORIZONTAL_VELOCITY_ACCEL_MASK
-        )
+        takeoff_yaw = generated.takeoff_yaw
+        if takeoff_yaw is not None:
+            type_mask = TAKEOFF_POSITION_VELOCITY_MASK
+            yaw = takeoff_yaw
+        else:
+            type_mask = (
+                POSITION_VELOCITY_MASK
+                if generated.horizontal_position_hold
+                else HORIZONTAL_VELOCITY_ACCEL_MASK
+            )
+            yaw = 0.0
         seq = self._setpoint_count + 1
         self._write(self._mav.set_position_target_local_ned_encode(
             int(now * 1000) & 0xFFFFFFFF,
@@ -763,8 +901,8 @@ class MyLinkMavlinkClient:
             ax,
             ay,
             0,
-            0,
-            0,
+            yaw,
+            0.0,
         ))
         self._setpoint_count = seq
         actual_velocity = (state.vx, state.vy, state.vz)
@@ -880,9 +1018,93 @@ class MyLinkMavlinkClient:
                 )
             self._state_changed.notify_all()
         if name == "COMMAND_ACK":
+            ack = CommandAck(
+                command=int(message.command),
+                result=int(message.result),
+                result_param2=int(getattr(message, "result_param2", 0)),
+                source_system=int(message.get_srcSystem()),
+                source_component=int(message.get_srcComponent()),
+            )
             with self._ack_changed:
-                self._acks.append((int(message.command), int(message.result)))
+                self._acks.append(ack)
                 self._ack_changed.notify_all()
+            self._handle_project_ack(ack)
+
+    def _handle_project_ack(self, ack: CommandAck) -> None:
+        if ack.command != MAV_CMD_CUSTOM_ACTION:
+            return
+
+        result = ack.project_result
+        if result in {
+            CUSTOM_RESULT_STARTED,
+            CUSTOM_RESULT_BUTTON_CONSUMED,
+            CUSTOM_RESULT_HANDOVER_PENDING,
+            CUSTOM_RESULT_TOP_HOLD,
+        }:
+            self.block_legacy_output()
+
+        if result == CUSTOM_RESULT_STARTED:
+            self._search_top_active = True
+            self.log(f"[CUSTOM1] accepted request={ack.project_request_id}; PX4 owns control")
+        elif result == CUSTOM_RESULT_BUTTON_CONSUMED:
+            self._search_top_active = False
+        elif result == CUSTOM_RESULT_TOP_HOLD:
+            self._search_top_active = False
+            self.log("[TOP_HOLD] PX4 reports top contact; holding contact position")
+        elif result == CUSTOM_RESULT_HANDOVER_PENDING:
+            self._search_top_active = False
+            with self._project_lock:
+                response_to_request = ack.project_request_id in self._outstanding_project_requests
+            if response_to_request:
+                self.log("[HANDOVER] PX4 is already waiting for the current rebase")
+                return
+            self.log(f"[HANDOVER] PX4 requests V3 rebase id={ack.project_request_id}")
+            threading.Thread(
+                target=self._complete_handover,
+                args=(ack.project_request_id,),
+                name="gui-v3-rebase",
+                daemon=True,
+            ).start()
+        elif result == CUSTOM_RESULT_REBASE_ACCEPTED:
+            self.allow_legacy_output()
+
+    def _complete_handover(self, handover_id: int) -> bool:
+        if not self._rebase_lock.acquire(blocking=False):
+            return False
+
+        try:
+            state = self.wait_until(
+                lambda item: (
+                    None not in (item.x, item.y, item.z)
+                    and item.local_position_age_s is not None
+                    and item.local_position_age_s <= 0.5
+                ),
+                3.0,
+                "fresh LOCAL_POSITION_NED for CUSTOM handover",
+            )
+            actual = (float(state.x), float(state.y), float(state.z))
+            self.reset_trajectory(actual, announce=True, stream_mode=state.mode)
+            self.block_legacy_output()
+            ack = self.send_project_command(CUSTOM_ACTION_REBASE_COMPLETE, float(handover_id))
+            accepted = (
+                ack.result == mavlink2.MAV_RESULT_ACCEPTED
+                and ack.project_result == CUSTOM_RESULT_REBASE_ACCEPTED
+            )
+            if not accepted:
+                raise RuntimeError(
+                    f"rebase rejected result={ack.result} project={ack.project_result}"
+                )
+            self.allow_legacy_output()
+            self.log(
+                f"[HANDOVER] rebase complete id={handover_id}; "
+                f"legacy target=N{actual[0]:.3f} E{actual[1]:.3f} D{actual[2]:.3f}"
+            )
+            return True
+        except Exception as exc:
+            self.log(f"[ERROR] CUSTOM handover remains blocked: {exc}")
+            return False
+        finally:
+            self._rebase_lock.release()
 
 
 class EventLog:
@@ -962,6 +1184,7 @@ class MyLinkController:
             self._last_mode = state.mode.upper()
             self._landing_requested = False
             client.reset_trajectory(self.origin, stream_mode=state.mode)
+            client.allow_legacy_output()
             client.start_setpoints()
             self.log.write(f"[OK] Origin NED={self.origin}; Local-NED stream 10 Hz started")
         except Exception:
@@ -1010,9 +1233,13 @@ class MyLinkController:
         entering = previous is not None and previous != "OFFBOARD" and mode == "OFFBOARD"
         leaving = previous == "OFFBOARD" and mode != "OFFBOARD"
         if mode != "OFFBOARD" or entering:
+            if mode != "OFFBOARD":
+                self.require_client().clear_search_top_active()
             actual = (float(state.x), float(state.y), float(state.z))
             self.origin = self.origin or actual
-            self.require_client().reset_trajectory(actual, stream_mode=mode)
+            client = self.require_client()
+            client.reset_trajectory(actual, stream_mode=mode)
+            client.allow_legacy_output()
             if entering:
                 self._landing_requested = False
                 self.log.write(
@@ -1071,6 +1298,8 @@ class MyLinkController:
         if client.takeoff_active():
             self.log.write("[IGNORED] DESCEND: TAKEOFF trajectory is active")
             return
+        if not self._legacy_direction_allowed(client, "DOWN"):
+            return
         old, new = client.offset_final_target((0.0, 0.0, value))
         self._log_target_change("DESCEND", old, new)
 
@@ -1092,6 +1321,8 @@ class MyLinkController:
         }
         if direction not in delta:
             raise ValueError(f"unknown direction {direction}")
+        if not self._legacy_direction_allowed(client, direction):
+            return
         old, new = client.offset_final_target(delta[direction])
         self._log_target_change(direction, old, new)
 
@@ -1105,16 +1336,79 @@ class MyLinkController:
         self.log.write(f"[TARGET] old final target: N={old[0]:.3f} E={old[1]:.3f} D={old[2]:.3f}")
         self.log.write(f"[TARGET] new final target: N={new[0]:.3f} E={new[1]:.3f} D={new[2]:.3f}")
 
+    def _legacy_direction_allowed(self, client: MyLinkMavlinkClient, direction: str) -> bool:
+        direction_ids = {
+            "FORWARD": 1,
+            "BACK": 2,
+            "LEFT": 3,
+            "RIGHT": 4,
+            "UP": 5,
+            "DOWN": 6,
+        }
+        ack = client.direction_intent(direction_ids[direction])
+        self.command_result(f"{direction} INTENT", ack.result)
+
+        if (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_LEGACY_ALLOWED
+        ):
+            return True
+
+        if (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_BUTTON_CONSUMED
+        ):
+            self.log.write(
+                f"[CUSTOM] first {direction} only cancels CUSTOM; movement not executed"
+            )
+            client._complete_handover(ack.project_request_id)
+            return False
+
+        self.log.write(
+            f"[IGNORED] {direction}: PX4 project_result={ack.project_result}; no target change"
+        )
+        return False
+
     def custom(self) -> None:
-        self.log.write("[CUSTOM] CUSTOM mode reserved / 尚未定义")
+        client = self._require_offboard("CUSTOM1 SEARCH_TOP")
+        if client is None:
+            return
+        if client.takeoff_active():
+            self.log.write("[IGNORED] CUSTOM1: TAKEOFF trajectory is active")
+            return
+        self.log.write("[CUSTOM1] command sent once")
+        ack = client.start_search_top()
+        self.command_result("CUSTOM1 SEARCH_TOP", ack.result)
+        if not (
+            ack.result == mavlink2.MAV_RESULT_ACCEPTED
+            and ack.project_result == CUSTOM_RESULT_STARTED
+        ):
+            client.clear_search_top_active()
+            self.log.write(
+                f"[CUSTOM1] rejected project_result={ack.project_result}; legacy control unchanged"
+            )
+
+    def simulate_laser_signal(self) -> None:
+        client = self.require_client()
+        if not client.search_top_active():
+            self.log.write("[IGNORED] 模拟激光信号：当前不在寻顶模式")
+            return
+        self.log.write("[INPUT] 模拟激光信号 pressed once")
+        ack = client.simulate_contact()
+        self.command_result("模拟激光信号", ack.result)
 
     def land(self) -> int:
         self._landing_requested = True
+        client = self.require_client()
+        client.clear_search_top_active()
         self.log.write("[INPUT] LAND pressed once; further movement targets disabled")
-        return self.command_result("LAND", self.require_client().land())
+        return self.command_result("LAND", client.land())
 
     def state(self) -> MyLinkState:
         return MyLinkState() if self.client is None else self.client.snapshot()
+
+    def search_top_active(self) -> bool:
+        return self.client is not None and self.client.search_top_active()
 
     def close(self) -> None:
         if self.client is not None:
@@ -1126,22 +1420,55 @@ class MyLinkController:
 
 
 class OffboardControlGuiV3:
+    MODE_ZH = {
+        "DISCONNECTED": "未连接",
+        "MANUAL": "手动模式",
+        "ALTCTL": "高度模式",
+        "POSCTL": "位置模式",
+        "AUTO": "自动模式",
+        "AUTO.READY": "自动准备",
+        "AUTO.TAKEOFF": "自动起飞",
+        "AUTO.LOITER": "自动悬停",
+        "AUTO.MISSION": "自动任务",
+        "AUTO.RTL": "自动返航",
+        "AUTO.LAND": "自动降落",
+        "AUTO.FOLLOW": "自动跟随",
+        "AUTO.PRECLAND": "精确降落",
+        "ACRO": "特技模式",
+        "OFFBOARD": "外部控制模式",
+        "STABILIZED": "稳定模式",
+        "RATTITUDE": "半自稳模式",
+        "TERMINATION": "飞行终止",
+    }
+
     TEXT = {
         "zh": {
-            "title": "PX4 MyLink Offboard 控制台 V3", "connection": "MAVLink UDP 连接",
+            "title": "PX4 MyLink Offboard 控制台 V3.1", "connection": "MAVLink UDP 连接",
             "connect": "连接", "disconnect": "断开", "language": "语言", "state": "PX4 状态",
             "control": "控制", "events": "事件日志", "address": "MAVLink UDP 地址",
-            "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "CUSTOM",
+            "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "寻顶模式",
+            "simulate_contact": "模拟激光信号",
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
+            "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
+            "battery_row": "电池", "target_row": "最终目标", "command_row": "当前指令",
+            "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
+            "mode": "模式", "armed": "解锁状态", "armed_yes": "已解锁", "armed_no": "未解锁",
+            "heartbeat": "心跳", "north": "北", "east": "东", "down_axis": "下", "speed": "速度",
         },
         "en": {
-            "title": "PX4 MyLink Offboard Console V3", "connection": "MAVLink UDP connection",
+            "title": "PX4 MyLink Offboard Console V3.1", "connection": "MAVLink UDP connection",
             "connect": "CONNECT", "disconnect": "DISCONNECT", "language": "Language", "state": "PX4 STATUS",
             "control": "CONTROL", "events": "EVENT LOG", "address": "MAVLink UDP address",
-            "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "CUSTOM", "forward": "FORWARD",
+            "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "SEARCH TOP", "forward": "FORWARD",
+            "simulate_contact": "SIMULATE LASER",
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
+            "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
+            "battery_row": "Battery", "target_row": "Final target", "command_row": "Command",
+            "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
+            "mode": "mode", "armed": "armed", "armed_yes": "True", "armed_no": "False",
+            "heartbeat": "heartbeat", "north": "N", "east": "E", "down_axis": "D", "speed": "v",
         },
     }
 
@@ -1156,7 +1483,7 @@ class OffboardControlGuiV3:
         self.language_var = tk.StringVar(value="中文")
         self.altitude_var = tk.StringVar(value="1.0")
         self.distance_var = tk.StringVar(value="0.5")
-        self.status_var = tk.StringVar(value="DISCONNECTED")
+        self.status_var = tk.StringVar(value=self.tr("disconnected"))
         self.position_var = tk.StringVar(value="N —  E —  D —")
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
@@ -1170,6 +1497,9 @@ class OffboardControlGuiV3:
 
     def tr(self, key: str) -> str:
         return self.TEXT[self.language][key]
+
+    def display_mode(self, mode: str) -> str:
+        return self.MODE_ZH.get(mode, mode) if self.language == "zh" else mode
 
     def _switch_language(self, _event=None) -> None:
         self.language = "en" if self.language_var.get() == "English" else "zh"
@@ -1212,24 +1542,23 @@ class OffboardControlGuiV3:
         status = ttk.LabelFrame(root, text=self.tr("state"), padding=10)
         status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
         for row, (name, variable) in enumerate((
-            ("State", self.status_var),
-            ("Position", self.position_var),
-            ("Velocity", self.velocity_var),
-            ("Battery", self.battery_var),
-            ("Final target", self.target_var),
-            ("Command", self.command_var),
+            (self.tr("status_row"), self.status_var),
+            (self.tr("position_row"), self.position_var),
+            (self.tr("velocity_row"), self.velocity_var),
+            (self.tr("battery_row"), self.battery_var),
+            (self.tr("target_row"), self.target_var),
+            (self.tr("command_row"), self.command_var),
         )):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
 
         control = ttk.LabelFrame(root, text=self.tr("control"), padding=10)
         control.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=(0, 12))
-        for column in range(4):
+        for column in range(3):
             control.columnconfigure(column, weight=1)
         self.action_buttons: list[ttk.Button] = []
         top_actions = (
             ("takeoff", lambda: self.controller.takeoff(self.altitude_var.get())),
-            ("descend", lambda: self.controller.descend(self.distance_var.get())),
             ("land", self.controller.land),
             ("custom", self.controller.custom),
         )
@@ -1239,6 +1568,13 @@ class OffboardControlGuiV3:
             self.action_buttons.append(button)
         ttk.Label(control, text=self.tr("altitude")).grid(row=1, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(control, textvariable=self.altitude_var, width=8).grid(row=1, column=1, sticky="w")
+        self.simulate_contact_button = ttk.Button(
+            control,
+            text=self.tr("simulate_contact"),
+            command=lambda: self.controller.submit("SIMULATE_CONTACT", self.controller.simulate_laser_signal),
+            state="disabled",
+        )
+        self.simulate_contact_button.grid(row=1, column=2, sticky="ew", padx=3, pady=(10, 3))
         ttk.Label(control, text=self.tr("distance")).grid(row=2, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(control, textvariable=self.distance_var, width=8).grid(row=2, column=1, sticky="w")
         directions = (
@@ -1278,24 +1614,37 @@ class OffboardControlGuiV3:
             return
         state = self.controller.state()
         self.controller.sync_target_to_mode(state)
+        connection_text = self.tr("connected") if state.connected else self.tr("disconnected")
+        armed_text = self.tr("armed_yes") if state.armed else self.tr("armed_no")
         self.status_var.set(
-            f"{'CONNECTED' if state.connected else 'DISCONNECTED'} | SYS={state.system_id} COMP={state.component_id} | "
-            f"mode={state.mode} | armed={state.armed} | heartbeat={self._fmt(state.heartbeat_age_s)}s"
+            f"{connection_text} | {self.tr('system')}={state.system_id} {self.tr('component')}={state.component_id} | "
+            f"{self.tr('mode')}={self.display_mode(state.mode)} | {self.tr('armed')}={armed_text} | "
+            f"{self.tr('heartbeat')}={self._fmt(state.heartbeat_age_s)}s"
         )
-        self.position_var.set(f"N {self._fmt(state.x)}  E {self._fmt(state.y)}  D {self._fmt(state.z)}")
-        self.velocity_var.set(f"vx {self._fmt(state.vx)}  vy {self._fmt(state.vy)}  vz {self._fmt(state.vz)} m/s")
+        self.position_var.set(
+            f"{self.tr('north')} {self._fmt(state.x)}  {self.tr('east')} {self._fmt(state.y)}  "
+            f"{self.tr('down_axis')} {self._fmt(state.z)}"
+        )
+        self.velocity_var.set(
+            f"{self.tr('north')} {self._fmt(state.vx)}  {self.tr('east')} {self._fmt(state.vy)}  "
+            f"{self.tr('down_axis')} {self._fmt(state.vz)} m/s"
+        )
         self.battery_var.set(f"{state.battery_percent if state.battery_percent is not None else '—'}%  {self._fmt(state.battery_voltage_v)}V")
         target = self.controller.target
-        self.target_var.set("N —  E —  D —" if target is None else f"N {target[0]:.2f}  E {target[1]:.2f}  D {target[2]:.2f}")
+        axes = (self.tr("north"), self.tr("east"), self.tr("down_axis"))
+        self.target_var.set(
+            f"{axes[0]} —  {axes[1]} —  {axes[2]} —" if target is None
+            else f"{axes[0]} {target[0]:.2f}  {axes[1]} {target[1]:.2f}  {axes[2]} {target[2]:.2f}"
+        )
         command = self.controller.command_setpoint
         if command is None:
-            self.command_var.set("N —  E —  D — | v —")
+            self.command_var.set(f"{axes[0]} —  {axes[1]} —  {axes[2]} — | {self.tr('speed')} —")
         else:
             px, py, pz = command.command_position
             vx, vy, vz = command.command_velocity
             self.command_var.set(
-                f"N {px:.2f}  E {py:.2f}  D {pz:.2f} | "
-                f"v {math.sqrt(vx * vx + vy * vy + vz * vz):.2f} m/s"
+                f"{axes[0]} {px:.2f}  {axes[1]} {py:.2f}  {axes[2]} {pz:.2f} | "
+                f"{self.tr('speed')} {math.sqrt(vx * vx + vy * vy + vz * vz):.2f} m/s"
             )
         connected = state.connected
         busy = self.controller.busy
@@ -1303,6 +1652,9 @@ class OffboardControlGuiV3:
         self.disconnect_button.configure(state="normal" if connected and not busy else "disabled")
         for button in self.action_buttons:
             button.configure(state="normal" if connected and not busy else "disabled")
+        self.simulate_contact_button.configure(
+            state="normal" if connected and not busy and self.controller.search_top_active() else "disabled"
+        )
         self.root.after(200, self._refresh)
 
     def _restore_events(self) -> None:
@@ -1343,10 +1695,15 @@ def self_test() -> None:
     generator.reset((0.0, 0.0, 0.0))
     generator.offset_final_target((0.5, 0.0, 0.0))
     first = generator.update((0.0, 0.0, 0.0), 0.1)
-    assert math.isclose(first.command_position[0], 0.003, abs_tol=1e-9)
+    # XY position is masked during velocity movement, so the diagnostic
+    # position carries final_target while velocity is acceleration-limited.
+    assert math.isclose(first.command_position[0], 0.5, abs_tol=1e-9)
     assert math.isclose(first.command_velocity[0], 0.03, abs_tol=1e-9)
+    ack = CommandAck(MAV_CMD_CUSTOM_ACTION, 0, (123 << 8) | CUSTOM_RESULT_STARTED, 1, 25)
+    assert ack.project_request_id == 123
+    assert ack.project_result == CUSTOM_RESULT_STARTED
     controller_names = set(dir(MyLinkController))
-    assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
+    assert {"takeoff", "descend", "move", "land", "custom", "simulate_laser_signal", "sync_target_to_mode"} <= controller_names
     source = Path(__file__).read_text(encoding="utf-8").split("def self_test()", 1)[0]
     assert "class FlightPhase" not in source
     assert "position_valid" not in source
@@ -1356,7 +1713,9 @@ def self_test() -> None:
     assert "MAV_CMD_COMPONENT_ARM_DISARM" not in source
     assert "MAV_CMD_DO_SET_MODE" not in source
     assert "DEFAULT_CONNECTION" in source
-    print("GUI V3 self-test: UDP stream-only API OK; no ARM/DISARM/OFFBOARD command; no connection opened")
+    assert "CUSTOM_ACTION_REBASE_COMPLETE" in source
+    assert "CUSTOM_ACTION_SIMULATE_CONTACT = 4" in source
+    print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")
 
 
 def main() -> None:

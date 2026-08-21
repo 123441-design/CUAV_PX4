@@ -35,15 +35,6 @@ parameters:
         max: 30.0
         default: 10.0
         decimal: 1
-      CUST_TOP_DBNC:
-        description:
-          short: Required continuous top-contact time
-        type: float
-        unit: s
-        min: 0.02
-        max: 0.50
-        default: 0.08
-        decimal: 2
       CUST_SENS_TO:
         description:
           short: Top-contact data timeout
