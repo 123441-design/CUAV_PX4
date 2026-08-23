@@ -44,6 +44,14 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__PX4_POSIX)
+# include <arpa/inet.h>
+# include <fcntl.h>
+# include <netinet/in.h>
+# include <sys/socket.h>
+# include <unistd.h>
+#endif
+
 using namespace time_literals;
 
 namespace
@@ -61,15 +69,19 @@ constexpr hrt_abstime kDirectMotorStopHold = 100_ms;
 
 ModuleBase::Descriptor MylinkBridge::desc{task_spawn, custom_command, print_usage};
 
-MylinkBridge::MylinkBridge(const char *device, uint32_t baudrate) :
+MylinkBridge::MylinkBridge(const char *device, uint32_t baudrate, int udp_port) :
 	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default),
-	_serial(device, baudrate)
+	_serial(device != nullptr ? device : "/dev/null", baudrate),
+	_udp_port(udp_port)
 {
 }
 
 MylinkBridge::~MylinkBridge()
 {
 	ScheduleClear();
+	#if defined(__PX4_POSIX)
+	closeUdp();
+	#endif
 	_serial.close();
 	perf_free(_loop_perf);
 	perf_free(_loop_interval_perf);
@@ -176,7 +188,22 @@ void MylinkBridge::sendMavlinkMessage(const mavlink_message_t &message)
 	uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
 	const uint16_t length = mavlink_msg_to_send_buffer(buffer, &message);
 	errno = 0;
-	const ssize_t written = _serial.writeBlocking(buffer, length, 10);
+	ssize_t written = -1;
+
+#if defined(__PX4_POSIX)
+	if (_udp_port > 0) {
+		if (_udp_fd >= 0 && _udp_peer_valid) {
+			written = sendto(_udp_fd, buffer, length, 0,
+					 reinterpret_cast<const sockaddr *>(&_udp_peer_addr), _udp_peer_addr_len);
+		} else {
+			errno = ENOTCONN;
+		}
+
+	} else
+#endif
+	{
+		written = _serial.writeBlocking(buffer, length, 10);
+	}
 
 	if (written > 0) {
 		_tx_bytes += static_cast<uint32_t>(written);
@@ -244,6 +271,11 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	mavlink_msg_ping_decode(&message, &ping);
 	_handled_messages++;
 
+	if (ping.target_component == custom_action_protocol::kComponentId) {
+		handleTopContactPing(message, ping);
+		return;
+	}
+
 	// target 0/0 is the standard MAVLink ping request. A targeted PING is a
 	// response and must not be echoed again.
 	if (ping.target_system != 0 || ping.target_component != 0) {
@@ -259,6 +291,43 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	mavlink_msg_ping_pack_status(system_id, component_id, &_tx_status, &response,
 				     ping.time_usec, ping.seq, message.sysid, message.compid);
 	sendMavlinkMessage(response);
+}
+
+void MylinkBridge::handleTopContactPing(const mavlink_message_t &message,
+		const mavlink_ping_t &ping)
+{
+	vehicle_status_s status{};
+	_vehicle_status_sub.copy(&status);
+	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
+
+	if (ping.target_system != 0 && ping.target_system != system_id) {
+		return;
+	}
+
+	const uint32_t encoded = ping.seq;
+	const bool valid = (encoded & custom_action_protocol::kTopContactPingValidMask) != 0;
+	const bool contact = (encoded & custom_action_protocol::kTopContactPingContactMask) != 0;
+	const uint32_t sequence = encoded & custom_action_protocol::kTopContactPingSequenceMask;
+
+	if (_top_contact_sequence_valid
+	    && message.sysid == _last_top_contact_system
+	    && message.compid == _last_top_contact_component
+	    && sequence == _last_top_contact_sequence) {
+		_duplicate_top_contact_reports++;
+		return;
+	}
+
+	top_contact_s report{};
+	report.timestamp = hrt_absolute_time();
+	report.valid = valid;
+	report.contact = valid && contact;
+	_top_contact_pub.publish(report);
+
+	_last_top_contact_sequence = sequence;
+	_last_top_contact_system = message.sysid;
+	_last_top_contact_component = message.compid;
+	_top_contact_sequence_valid = true;
+	_top_contact_reports++;
 }
 
 void MylinkBridge::handleHeartbeat(const mavlink_message_t &message)
@@ -638,6 +707,7 @@ void MylinkBridge::clearSessionState()
 	_event_flags = EventNone;
 	_latest_event_command = 0;
 	_commander_owns_control = false;
+	_top_contact_sequence_valid = false;
 	_session_resets++;
 }
 
@@ -799,14 +869,133 @@ void MylinkBridge::readSerial()
 	}
 }
 
+#if defined(__PX4_POSIX)
+bool MylinkBridge::openUdp()
+{
+	_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (_udp_fd < 0) {
+		_last_rx_errno = errno;
+		return false;
+	}
+
+	const int reuse = 1;
+	(void)setsockopt(_udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+	const int flags = fcntl(_udp_fd, F_GETFL, 0);
+
+	if (flags < 0 || fcntl(_udp_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		_last_rx_errno = errno;
+		closeUdp();
+		return false;
+	}
+
+	sockaddr_in address{};
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_ANY);
+	address.sin_port = htons(static_cast<uint16_t>(_udp_port));
+
+	if (bind(_udp_fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0) {
+		_last_rx_errno = errno;
+		closeUdp();
+		return false;
+	}
+
+	_udp_peer_valid = false;
+	return true;
+}
+
+void MylinkBridge::closeUdp()
+{
+	if (_udp_fd >= 0) {
+		::close(_udp_fd);
+		_udp_fd = -1;
+	}
+
+	_udp_peer_valid = false;
+	_udp_peer_addr_len = 0;
+}
+
+void MylinkBridge::readUdp()
+{
+	uint8_t buffer[2048];
+
+	for (unsigned drain = 0; drain < kMaximumDrainReads; ++drain) {
+		sockaddr_storage peer{};
+		socklen_t peer_length = sizeof(peer);
+		errno = 0;
+		const ssize_t bytes_read = recvfrom(_udp_fd, buffer, sizeof(buffer), 0,
+					      reinterpret_cast<sockaddr *>(&peer), &peer_length);
+
+		if (bytes_read < 0) {
+			if (errno != EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+			    && errno != EWOULDBLOCK
+#endif
+			   ) {
+				_rx_errors++;
+				_last_rx_errno = errno;
+			}
+
+			return;
+		}
+
+		_udp_peer_addr = peer;
+		_udp_peer_addr_len = peer_length;
+		_udp_peer_valid = true;
+		_rx_bytes += static_cast<uint32_t>(bytes_read);
+
+		for (ssize_t index = 0; index < bytes_read; ++index) {
+			mavlink_message_t message{};
+			mavlink_status_t status{};
+			const uint8_t framing = mavlink_frame_char_buffer(&_rx_parser_message, &_rx_parser_status,
+						buffer[index], &message, &status);
+
+			if (framing == MAVLINK_FRAMING_OK) {
+				_valid_frames++;
+				handleMavlinkMessage(message);
+
+			} else if (framing == MAVLINK_FRAMING_BAD_CRC || framing == MAVLINK_FRAMING_BAD_SIGNATURE) {
+				_bad_frames++;
+			}
+		}
+	}
+}
+#endif
+
 void MylinkBridge::Run()
 {
 	if (should_exit()) {
 		ScheduleClear();
+		#if defined(__PX4_POSIX)
+		closeUdp();
+		#endif
 		_serial.close();
 		exit_and_cleanup(desc);
 		return;
 	}
+
+	#if defined(__PX4_POSIX)
+	if (_udp_port > 0) {
+		if (_udp_fd < 0) {
+			if (!openUdp()) {
+				PX4_ERR("open UDP port %d failed (%d); retrying", _udp_port, _last_rx_errno);
+				ScheduleDelayed(1_s);
+				return;
+			}
+
+			PX4_INFO("MAVLink UDP RX listening on 0.0.0.0:%d", _udp_port);
+			ScheduleOnInterval(kRunInterval);
+		}
+
+		perf_begin(_loop_perf);
+		perf_count(_loop_interval_perf);
+		updateGateAndCachedMessage();
+		relayVehicleCommandAcks();
+		readUdp();
+		perf_end(_loop_perf);
+		return;
+	}
+	#endif
 
 	if (!_serial.isOpen()) {
 		if (!_serial.open()) {
@@ -834,11 +1023,20 @@ int MylinkBridge::task_spawn(int argc, char *argv[])
 	const char *option_argument = nullptr;
 	const char *device = nullptr;
 	int baudrate = 115200;
+	int udp_port = -1;
 
-	while ((option = px4_getopt(argc, argv, "d:b:", &option_index, &option_argument)) != EOF) {
+	while ((option = px4_getopt(argc, argv, "d:b:u:", &option_index, &option_argument)) != EOF) {
 		switch (option) {
 		case 'd':
 			device = option_argument;
+			break;
+
+		case 'u':
+			if (px4_get_parameter_value(option_argument, udp_port) != 0) {
+				PX4_ERR("invalid UDP port");
+				return PX4_ERROR;
+			}
+
 			break;
 
 		case 'b':
@@ -854,12 +1052,22 @@ int MylinkBridge::task_spawn(int argc, char *argv[])
 		}
 	}
 
-	if (device == nullptr || !device::Serial::validatePort(device) || baudrate <= 0) {
-		PX4_ERR("valid -d <device> and -b <baudrate> are required");
+	const bool serial_valid = device != nullptr && device::Serial::validatePort(device) && baudrate > 0;
+	const bool udp_valid = udp_port > 0 && udp_port <= UINT16_MAX;
+
+#if !defined(__PX4_POSIX)
+	if (udp_valid) {
+		PX4_ERR("UDP transport is only available in SITL/POSIX");
+		return PX4_ERROR;
+	}
+#endif
+
+	if (serial_valid == udp_valid) {
+		PX4_ERR("select exactly one transport: -d <device> or -u <UDP port>");
 		return PX4_ERROR;
 	}
 
-	MylinkBridge *instance = new MylinkBridge(device, static_cast<uint32_t>(baudrate));
+	MylinkBridge *instance = new MylinkBridge(device, static_cast<uint32_t>(baudrate), udp_port);
 
 	if (instance != nullptr) {
 		desc.object.store(instance);
@@ -882,10 +1090,20 @@ int MylinkBridge::print_status()
 	const GateState state = gateState(&status);
 	const char *state_name = state == GateState::Active ? "ACTIVE" :
 				state == GateState::CacheOnly ? "CACHE_ONLY" : "CLOSED";
-	PX4_INFO("port=%s baud=%" PRIu32 " MAVLink2 gate=%s armed=%s nav_state=%u",
+	#if defined(__PX4_POSIX)
+	if (_udp_port > 0) {
+		PX4_INFO("transport=UDP port=%d peer=%s MAVLink2 gate=%s armed=%s nav_state=%u",
+			 _udp_port, _udp_peer_valid ? "connected" : "waiting", state_name,
+			 status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "yes" : "no",
+			 status.nav_state);
+	} else
+	#endif
+	{
+		PX4_INFO("transport=UART port=%s baud=%" PRIu32 " MAVLink2 gate=%s armed=%s nav_state=%u",
 		 _serial.getPort(), _serial.getBaudrate(), state_name,
 		 status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "yes" : "no",
 		 status.nav_state);
+	}
 	PX4_INFO("rx: bytes=%" PRIu32 " valid_frames=%" PRIu32 " bad_frames=%" PRIu32
 		 " gate_dropped=%" PRIu32 " cached_updates=%" PRIu32 " handled=%" PRIu32 " unsupported=%" PRIu32,
 		 _rx_bytes, _valid_frames, _bad_frames, _gate_dropped_frames,
@@ -907,6 +1125,8 @@ int MylinkBridge::print_status()
 		 " ack_relayed=%" PRIu32,
 		 _custom_action_commands, _custom_action_status.control_owner, _custom_action_status.state,
 		 _custom_action_status.handover_id, _legacy_setpoints_blocked, _relayed_command_acks);
+	PX4_INFO("top_contact: reports=%" PRIu32 " invalid=%" PRIu32 " duplicate=%" PRIu32,
+		 _top_contact_reports, _invalid_top_contact_reports, _duplicate_top_contact_reports);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,
@@ -936,6 +1156,7 @@ int MylinkBridge::print_usage(const char *reason)
 	PRINT_MODULE_USAGE_COMMAND("start");
 	PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, "<device>", "Serial device", false);
 	PRINT_MODULE_USAGE_PARAM_INT('b', 115200, 9600, 3000000, "Baudrate", true);
+	PRINT_MODULE_USAGE_PARAM_INT('u', 14541, 1, 65535, "SITL UDP listen port", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	return 0;
 }

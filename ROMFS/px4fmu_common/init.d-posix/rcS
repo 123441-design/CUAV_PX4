@@ -259,6 +259,7 @@ fi
 if param compare -s CUST_TOP_EN 1
 then
 	custom_action_control start
+	mylink_bridge start -u 14541
 fi
 
 if param greater SIM_BAT_DRAIN 0

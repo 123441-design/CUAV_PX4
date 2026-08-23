@@ -45,6 +45,7 @@
 #include <uORB/topics/custom_action_status.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
+#include <uORB/topics/top_contact.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
 #include <uORB/topics/vehicle_control_mode.h>
@@ -52,13 +53,16 @@
 
 #include <mavlink.h>
 #include <mavlink_types.h>
+#if defined(__PX4_POSIX)
+# include <sys/socket.h>
+#endif
 
 class MylinkBridge : public ModuleBase, public px4::ScheduledWorkItem
 {
 public:
 	static Descriptor desc;
 
-	MylinkBridge(const char *device, uint32_t baudrate);
+	MylinkBridge(const char *device, uint32_t baudrate, int udp_port = -1);
 	~MylinkBridge() override;
 
 	static int task_spawn(int argc, char *argv[]);
@@ -89,6 +93,11 @@ private:
 
 	void Run() override;
 	void readSerial();
+	#if defined(__PX4_POSIX)
+	void readUdp();
+	bool openUdp();
+	void closeUdp();
+	#endif
 	void handleMavlinkMessage(const mavlink_message_t &message);
 	void processMavlinkMessage(const mavlink_message_t &message);
 	void updateGateAndCachedMessage();
@@ -100,6 +109,8 @@ private:
 	void handleCommandLong(const mavlink_message_t &message);
 	void handleCustomActionCommand(const mavlink_message_t &message,
 				       const mavlink_command_long_t &command);
+	void handleTopContactPing(const mavlink_message_t &message,
+				  const mavlink_ping_t &ping);
 	void handleMotorTestCommand(const mavlink_message_t &message,
 				    const mavlink_command_long_t &command);
 	void handleOffboardModeCommand(const mavlink_message_t &message,
@@ -137,12 +148,20 @@ private:
 	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
+	uORB::Publication<top_contact_s> _top_contact_pub{ORB_ID(top_contact)};
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
 	perf_counter_t _loop_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")};
 	perf_counter_t _loop_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": interval")};
 
 	device::Serial _serial;
+	int _udp_port{-1};
+#if defined(__PX4_POSIX)
+	int _udp_fd{-1};
+	struct sockaddr_storage _udp_peer_addr{};
+	socklen_t _udp_peer_addr_len{0};
+	bool _udp_peer_valid{false};
+#endif
 	mavlink_message_t _rx_parser_message{};
 	mavlink_status_t _rx_parser_status{};
 	mavlink_status_t _tx_status{};
@@ -160,6 +179,9 @@ private:
 	uint32_t _trajectory_setpoints_published{0};
 	uint32_t _offboard_mode_requests{0};
 	uint32_t _custom_action_commands{0};
+	uint32_t _top_contact_reports{0};
+	uint32_t _invalid_top_contact_reports{0};
+	uint32_t _duplicate_top_contact_reports{0};
 	uint32_t _legacy_setpoints_blocked{0};
 	uint32_t _relayed_command_acks{0};
 	uint32_t _invalid_setpoints{0};
@@ -187,6 +209,10 @@ private:
 	uint16_t _remote_component{0};
 	uint32_t _event_flags{EventNone};
 	uint16_t _latest_event_command{0};
+	uint16_t _last_top_contact_sequence{0};
+	uint8_t _last_top_contact_system{0};
+	uint8_t _last_top_contact_component{0};
+	bool _top_contact_sequence_valid{false};
 	bool _direct_motor_active{false};
 	bool _direct_motor_stopping{false};
 	float _motor_throttle_percent{0.f};

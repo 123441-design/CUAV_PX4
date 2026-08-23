@@ -1,7 +1,6 @@
-# Debounced input source is handled by custom_action_control. The future STM32
-# UART driver only needs to publish this raw, timestamped contact state.
+# MyLink publishes this raw state from the 20 Hz MAVLink sensor report.
+# custom_action_control owns freshness checks and four-sample confirmation.
 
 uint64 timestamp
 bool contact
 bool valid
-

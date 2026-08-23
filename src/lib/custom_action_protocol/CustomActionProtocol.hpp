@@ -10,12 +10,14 @@ namespace custom_action_protocol
 {
 constexpr uint16_t kMavCmdUser1 = 31010;
 constexpr uint8_t kComponentId = 25; // MAV_COMP_ID_USER1
+constexpr uint32_t kTopContactPingContactMask = 1u << 31;
+constexpr uint32_t kTopContactPingValidMask = 1u << 30;
+constexpr uint32_t kTopContactPingSequenceMask = (1u << 30) - 1u;
 
 enum class Command : uint8_t {
 	SearchTop = 1,
 	DirectionIntent = 2,
 	RebaseComplete = 3,
-	SimulateContact = 4,
 };
 
 enum class Direction : uint8_t {
@@ -35,7 +37,6 @@ enum class Result : uint8_t {
 	RebaseAccepted = 4,
 	HandoverPending = 5,
 	TopHoldEntered = 6,
-	ContactSignalAccepted = 7,
 };
 
 constexpr int32_t encodeResult(uint16_t request_id, Result result)

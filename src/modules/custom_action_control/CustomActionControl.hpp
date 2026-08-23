@@ -43,7 +43,6 @@ private:
 	void startSearchTop(const vehicle_command_s &command, uint16_t request_id);
 	void handleDirectionIntent(const vehicle_command_s &command, uint16_t request_id);
 	void handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id);
-	void handleSimulateContact(const vehicle_command_s &command, uint16_t request_id);
 	void enterTopHold();
 	void beginHandover(uint8_t reason, uint16_t handover_id, uint8_t target_system,
 			   uint16_t target_component, bool notify_pending);

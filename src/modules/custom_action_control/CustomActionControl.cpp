@@ -199,25 +199,6 @@ void CustomActionControl::handleDirectionIntent(const vehicle_command_s &command
 	}
 }
 
-void CustomActionControl::handleSimulateContact(const vehicle_command_s &command, uint16_t request_id)
-{
-	if (_owner != custom_action_status_s::OWNER_CUSTOM
-	    || _state != custom_action_status_s::STATE_SEARCH_TOP
-	    || !flightStateAllowsCustom()) {
-		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
-			   static_cast<uint8_t>(Result::None));
-		return;
-	}
-
-	// TEST ONLY: updateTestContact() will publish fresh contact=true samples at
-	// the module's 50 Hz cycle. The normal four-sample confirmation still
-	// applies, so this path exercises the same debounce logic as the real input.
-	_test_contact_mode.store(1);
-	publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
-		   static_cast<uint8_t>(Result::ContactSignalAccepted));
-	(void)request_id;
-}
-
 void CustomActionControl::handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id)
 {
 	const uint16_t supplied_handover_id = static_cast<uint16_t>(lroundf(command.param2));
@@ -269,10 +250,6 @@ void CustomActionControl::handleCommand(const vehicle_command_s &command)
 
 	case Command::RebaseComplete:
 		handleRebaseComplete(command, request_id);
-		break;
-
-	case Command::SimulateContact:
-		handleSimulateContact(command, request_id);
 		break;
 
 	default:

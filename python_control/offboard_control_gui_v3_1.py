@@ -27,6 +27,8 @@ from pymavlink.dialects.v20 import common as mavlink2
 
 
 DEFAULT_CONNECTION = "udp:127.0.0.1:14540"
+SITL_MYLINK_UDP_PORT = 14541
+CONNECTION_SETTINGS_PATH = Path.home() / ".offboard_control_gui_v3_1_udp"
 SOURCE_SYSTEM = 42
 SOURCE_COMPONENT = 191
 TARGET_SYSTEM = 1
@@ -36,7 +38,6 @@ MAV_CMD_CUSTOM_ACTION = mavlink2.MAV_CMD_USER_1
 CUSTOM_ACTION_SEARCH_TOP = 1
 CUSTOM_ACTION_DIRECTION_INTENT = 2
 CUSTOM_ACTION_REBASE_COMPLETE = 3
-CUSTOM_ACTION_SIMULATE_CONTACT = 4
 CUSTOM_RESULT_STARTED = 1
 CUSTOM_RESULT_BUTTON_CONSUMED = 2
 CUSTOM_RESULT_LEGACY_ALLOWED = 3
@@ -44,6 +45,10 @@ CUSTOM_RESULT_REBASE_ACCEPTED = 4
 CUSTOM_RESULT_HANDOVER_PENDING = 5
 CUSTOM_RESULT_TOP_HOLD = 6
 SETPOINT_RATE_HZ = 10.0
+TOP_CONTACT_REPORT_RATE_HZ = 20.0
+TOP_CONTACT_PING_CONTACT_MASK = 1 << 31
+TOP_CONTACT_PING_VALID_MASK = 1 << 30
+TOP_CONTACT_PING_SEQUENCE_MASK = (1 << 30) - 1
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
 Z_MAX_SPEED_UP_M_S = 0.30
@@ -61,6 +66,38 @@ MAX_ALTITUDE_M = 3.0
 MIN_MOVE_M = 0.1
 MAX_MOVE_M = 5.0
 HEARTBEAT_TIMEOUT_S = 3.0
+
+
+def load_saved_connection() -> str:
+    try:
+        saved = CONNECTION_SETTINGS_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return DEFAULT_CONNECTION
+    return saved if saved.lower().startswith("udp:") else DEFAULT_CONNECTION
+
+
+def save_successful_connection(connection_string: str) -> None:
+    connection = connection_string.strip()
+    if not connection.lower().startswith("udp:"):
+        raise ValueError("仅保存udp:开头的MAVLink地址")
+    temporary = CONNECTION_SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(connection + "\n", encoding="utf-8")
+    temporary.replace(CONNECTION_SETTINGS_PATH)
+
+
+def sitl_mylink_connection(connection_string: str) -> str | None:
+    """Return the SITL-only MyLink side channel for the standard PX4 endpoint."""
+    if not connection_string.lower().startswith("udp:"):
+        return None
+    try:
+        host, port_text = connection_string[4:].rsplit(":", 1)
+        port = int(port_text)
+    except (ValueError, TypeError):
+        return None
+    if host.lower() not in {"127.0.0.1", "localhost", "0.0.0.0"} or port != 14540:
+        return None
+    destination = "127.0.0.1" if host == "0.0.0.0" else host
+    return f"udpout:{destination}:{SITL_MYLINK_UDP_PORT}"
 
 POSITION_VELOCITY_MASK = (
     mavlink2.POSITION_TARGET_TYPEMASK_AX_IGNORE
@@ -520,6 +557,7 @@ class MyLinkMavlinkClient:
         self.trace_log = trace_logger or (lambda _message: None)
 
         self._connection = None
+        self._custom_connection = None
         self._mav = mavlink2.MAVLink(
             None,
             srcSystem=self.source_system,
@@ -551,6 +589,10 @@ class MyLinkMavlinkClient:
         self._rebase_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._search_top_active = False
+        self._top_contact_lock = threading.Lock()
+        self._top_contact_asserted = False
+        self._top_contact_sequence = 0
+        self._top_contact_tx_count = 0
 
     def start(self, timeout_s: float = 12.0) -> None:
         if self._connection is not None:
@@ -563,13 +605,29 @@ class MyLinkMavlinkClient:
             autoreconnect=True,
             force_connected=True,
         )
+        custom_endpoint = sitl_mylink_connection(self.connection_string)
+        if custom_endpoint is not None:
+            self._custom_connection = mavutil.mavlink_connection(
+                custom_endpoint,
+                source_system=self.source_system,
+                source_component=self.source_component,
+                dialect="common",
+                force_connected=True,
+            )
         self._stop.clear()
         self._legacy_output_allowed = True
         self._search_top_active = False
+        with self._top_contact_lock:
+            self._top_contact_asserted = False
+            self._top_contact_sequence = 0
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
         ]
+        if self._custom_connection is not None:
+            self._threads.append(
+                threading.Thread(target=self._custom_receive_loop, name="mylink-custom-rx", daemon=True)
+            )
         for thread in self._threads:
             thread.start()
         self.wait_until(lambda state: state.connected, timeout_s, "MyLink HEARTBEAT")
@@ -586,7 +644,7 @@ class MyLinkMavlinkClient:
     def close(self) -> None:
         self._stop.set()
         self._legacy_output_allowed = False
-        self._search_top_active = False
+        self.clear_search_top_active()
         for thread in self._threads:
             thread.join(timeout=1.0)
         self._threads.clear()
@@ -594,6 +652,10 @@ class MyLinkMavlinkClient:
         self._connection = None
         if connection is not None:
             connection.close()
+        custom_connection = self._custom_connection
+        self._custom_connection = None
+        if custom_connection is not None:
+            custom_connection.close()
         with self._state_changed:
             self._state = replace(self._state, connected=False, mode="DISCONNECTED")
             self._state_changed.notify_all()
@@ -745,7 +807,10 @@ class MyLinkMavlinkClient:
             *[float(value) for value in params],
         )
         self._command_tx_count += 1
-        self._write(message)
+        if target_component == CUSTOM_COMPONENT:
+            self._write_custom(message)
+        else:
+            self._write(message)
         deadline = time.monotonic() + timeout_s
         with self._ack_changed:
             while True:
@@ -798,18 +863,23 @@ class MyLinkMavlinkClient:
         return self.send_project_command(CUSTOM_ACTION_DIRECTION_INTENT, float(direction_id))
 
     def start_search_top(self) -> CommandAck:
+        with self._top_contact_lock:
+            self._top_contact_asserted = False
         return self.send_project_command(CUSTOM_ACTION_SEARCH_TOP)
 
-    def simulate_contact(self) -> CommandAck:
+    def simulate_contact(self) -> None:
         if not self._search_top_active:
             raise RuntimeError("模拟激光信号仅可在寻顶模式运行期间发送")
-        return self.send_project_command(CUSTOM_ACTION_SIMULATE_CONTACT, 1.0)
+        with self._top_contact_lock:
+            self._top_contact_asserted = True
 
     def search_top_active(self) -> bool:
         return self._search_top_active
 
     def clear_search_top_active(self) -> None:
         self._search_top_active = False
+        with self._top_contact_lock:
+            self._top_contact_asserted = False
 
     def land(self) -> int:
         self.block_legacy_output()
@@ -825,6 +895,13 @@ class MyLinkMavlinkClient:
         with self._tx_lock:
             connection.mav.send(message, force_mavlink1=False)
 
+    def _write_custom(self, message) -> None:
+        connection = self._custom_connection or self._connection
+        if connection is None:
+            raise RuntimeError("MAVLink UDP 未连接")
+        with self._tx_lock:
+            connection.mav.send(message, force_mavlink1=False)
+
     def _send_heartbeat(self) -> None:
         self._write(self._mav.heartbeat_encode(
             mavlink2.MAV_TYPE_GCS,
@@ -834,6 +911,23 @@ class MyLinkMavlinkClient:
             mavlink2.MAV_STATE_ACTIVE,
         ))
         self._heartbeat_tx_count += 1
+
+    def _send_top_contact_report(self) -> None:
+        with self._top_contact_lock:
+            self._top_contact_sequence = (self._top_contact_sequence % 0xFFFF) + 1
+            sequence = self._top_contact_sequence
+            encoded = sequence | TOP_CONTACT_PING_VALID_MASK
+            if self._top_contact_asserted:
+                encoded |= TOP_CONTACT_PING_CONTACT_MASK
+
+        message = self._mav.ping_encode(
+            int(time.time_ns() // 1000),
+            int(encoded),
+            self.target_system,
+            CUSTOM_COMPONENT,
+        )
+        self._write_custom(message)
+        self._top_contact_tx_count += 1
 
     def _send_setpoint(self) -> None:
         if not self._legacy_output_allowed:
@@ -934,12 +1028,16 @@ class MyLinkMavlinkClient:
     def _transmit_loop(self) -> None:
         next_heartbeat = 0.0
         next_setpoint = 0.0
+        next_top_contact = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
             try:
                 if now >= next_heartbeat:
                     self._send_heartbeat()
                     next_heartbeat = now + 1.0
+                if now >= next_top_contact:
+                    self._send_top_contact_report()
+                    next_top_contact = now + 1.0 / TOP_CONTACT_REPORT_RATE_HZ
                 if self._setpoints_enabled and now >= next_setpoint:
                     self._send_setpoint()
                     next_setpoint = now + 1.0 / self.setpoint_rate_hz
@@ -957,6 +1055,19 @@ class MyLinkMavlinkClient:
                 message = connection.recv_match(blocking=True, timeout=0.1)
             except OSError as exc:
                 self._record_error(str(exc))
+                return
+            if message is not None and message.get_type() != "BAD_DATA":
+                self._handle_message(message)
+
+    def _custom_receive_loop(self) -> None:
+        connection = self._custom_connection
+        if connection is None:
+            return
+        while not self._stop.is_set():
+            try:
+                message = connection.recv_match(blocking=True, timeout=0.1)
+            except OSError as exc:
+                self._record_error(f"MyLink SITL UDP: {exc}")
                 return
             if message is not None and message.get_type() != "BAD_DATA":
                 self._handle_message(message)
@@ -1018,6 +1129,12 @@ class MyLinkMavlinkClient:
                 )
             self._state_changed.notify_all()
         if name == "COMMAND_ACK":
+            if (
+                int(message.command) == MAV_CMD_CUSTOM_ACTION
+                and self._custom_connection is not None
+                and int(message.get_srcComponent()) != CUSTOM_COMPONENT
+            ):
+                return
             ack = CommandAck(
                 command=int(message.command),
                 result=int(message.result),
@@ -1045,14 +1162,16 @@ class MyLinkMavlinkClient:
 
         if result == CUSTOM_RESULT_STARTED:
             self._search_top_active = True
+            with self._top_contact_lock:
+                self._top_contact_asserted = False
             self.log(f"[CUSTOM1] accepted request={ack.project_request_id}; PX4 owns control")
         elif result == CUSTOM_RESULT_BUTTON_CONSUMED:
-            self._search_top_active = False
+            self.clear_search_top_active()
         elif result == CUSTOM_RESULT_TOP_HOLD:
-            self._search_top_active = False
+            self.clear_search_top_active()
             self.log("[TOP_HOLD] PX4 reports top contact; holding contact position")
         elif result == CUSTOM_RESULT_HANDOVER_PENDING:
-            self._search_top_active = False
+            self.clear_search_top_active()
             with self._project_lock:
                 response_to_request = ack.project_request_id in self._outstanding_project_requests
             if response_to_request:
@@ -1175,6 +1294,11 @@ class MyLinkController:
         self.client = client
         try:
             client.start()
+            try:
+                save_successful_connection(client.connection_string)
+                self.log.write(f"[OK] 已保存UDP地址：{client.connection_string}")
+            except (OSError, ValueError) as exc:
+                self.log.write(f"[WARN] UDP地址保存失败：{exc}")
             state = client.wait_until(
                 lambda item: None not in (item.x, item.y, item.z),
                 8.0,
@@ -1394,8 +1518,8 @@ class MyLinkController:
             self.log.write("[IGNORED] 模拟激光信号：当前不在寻顶模式")
             return
         self.log.write("[INPUT] 模拟激光信号 pressed once")
-        ack = client.simulate_contact()
-        self.command_result("模拟激光信号", ack.result)
+        client.simulate_contact()
+        self.log.write("[SENSOR] 开始以20Hz发送 valid=true, contact=true，等待PX4四包确认")
 
     def land(self) -> int:
         self._landing_requested = True
@@ -1702,6 +1826,18 @@ def self_test() -> None:
     ack = CommandAck(MAV_CMD_CUSTOM_ACTION, 0, (123 << 8) | CUSTOM_RESULT_STARTED, 1, 25)
     assert ack.project_request_id == 123
     assert ack.project_result == CUSTOM_RESULT_STARTED
+    client = MyLinkMavlinkClient(DEFAULT_CONNECTION)
+    reports = []
+    client._write_custom = reports.append
+    client._send_top_contact_report()
+    assert reports[-1].get_type() == "PING"
+    assert reports[-1].target_component == CUSTOM_COMPONENT
+    assert reports[-1].seq == TOP_CONTACT_PING_VALID_MASK | 1
+    client._search_top_active = True
+    client.simulate_contact()
+    client._send_top_contact_report()
+    assert reports[-1].seq == TOP_CONTACT_PING_VALID_MASK | TOP_CONTACT_PING_CONTACT_MASK | 2
+    client.clear_search_top_active()
     controller_names = set(dir(MyLinkController))
     assert {"takeoff", "descend", "move", "land", "custom", "simulate_laser_signal", "sync_target_to_mode"} <= controller_names
     source = Path(__file__).read_text(encoding="utf-8").split("def self_test()", 1)[0]
@@ -1714,20 +1850,23 @@ def self_test() -> None:
     assert "MAV_CMD_DO_SET_MODE" not in source
     assert "DEFAULT_CONNECTION" in source
     assert "CUSTOM_ACTION_REBASE_COMPLETE" in source
-    assert "CUSTOM_ACTION_SIMULATE_CONTACT = 4" in source
+    assert "TOP_CONTACT_REPORT_RATE_HZ = 20.0" in source
+    assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
+    assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
     print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--connection", default=DEFAULT_CONNECTION)
+    parser.add_argument("--connection", default=None)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
     root = tk.Tk()
-    OffboardControlGuiV3(root, args.connection)
+    initial_connection = args.connection or load_saved_connection()
+    OffboardControlGuiV3(root, initial_connection)
     root.mainloop()
 
 
