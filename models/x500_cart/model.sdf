@@ -8,18 +8,72 @@
       <uri>x500</uri>
     </include>
 
+    <!-- Holybro H-Flow simulation equivalent: downward optical flow + ToF range. -->
+    <include merge='true'>
+      <uri>model://optical_flow</uri>
+      <pose relative_to="base_link">0.03 0 -0.1 0 0 0</pose>
+    </include>
+    <include merge='true'>
+      <uri>model://LW20</uri>
+      <pose relative_to="base_link">0 0 -0.079 0 1.57 0</pose>
+    </include>
+    <joint name="hflow_optical_flow_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>flow_link</child>
+      <pose relative_to="base_link">0 0 -0.1 0 1.5707 0</pose>
+    </joint>
+    <joint name="hflow_lidar_model_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>lw20_link</child>
+      <pose relative_to="base_link">0 0 0 0 0 0</pose>
+    </joint>
+    <joint name="hflow_lidar_sensor_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>lidar_sensor_link</child>
+    </joint>
+    <link name="lidar_sensor_link">
+      <pose relative_to="base_link">0 0 -0.05 0 1.57 0</pose>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <iyy>0.00001</iyy>
+          <izz>0.00001</izz>
+          <ixy>0.0</ixy>
+          <ixz>0.0</ixz>
+          <iyz>0.0</iyz>
+        </inertia>
+      </inertial>
+      <sensor name="lidar" type="gpu_lidar">
+        <gz_frame_id>lidar_sensor_link</gz_frame_id>
+        <pose>0 0 0 3.14 0 0</pose>
+        <update_rate>50</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.08</min><max>30.0</max><resolution>0.01</resolution></range>
+        </ray>
+        <always_on>1</always_on>
+        <!-- Keep the 50 Hz H-Flow range measurement, but do not render its debug ray. -->
+        <visualize>false</visualize>
+      </sensor>
+    </link>
+
     <!-- 中柱：把倒装小车抬升到旋翼平面之上（细柱落在中心无桨扫掠区） -->
     <link name="cart_mast">
       <pose relative_to="base_link">0 0 0.09 0 0 0</pose>
       <inertial>
-        <mass>0.05</mass>
+        <!-- Lightweight attachment: keep stock gz_x500 flight dynamics. -->
+        <mass>0.001</mass>
         <inertia>
-          <ixx>3.04e-5</ixx>
+          <ixx>6.08e-7</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>3.04e-5</iyy>
+          <iyy>6.08e-7</iyy>
           <iyz>0</iyz>
-          <izz>7.5e-6</izz>
+          <izz>1.5e-7</izz>
         </inertia>
       </inertial>
       <visual name="cart_mast_visual">
@@ -56,14 +110,15 @@
     <link name="cart_chassis">
       <pose relative_to="base_link">0 0 0.145 0 0 0</pose>
       <inertial>
-        <mass>0.5</mass>
+        <!-- Collision and visuals are retained without changing x500 handling. -->
+        <mass>0.005</mass>
         <inertia>
-          <ixx>9.75e-4</ixx>
+          <ixx>9.75e-6</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>2.2417e-3</iyy>
+          <iyy>2.2417e-5</iyy>
           <iyz>0</iyz>
-          <izz>3.1417e-3</izz>
+          <izz>3.1417e-5</izz>
         </inertia>
       </inertial>
       <visual name="cart_chassis_visual">
@@ -90,6 +145,68 @@
           </friction>
         </surface>
       </collision>
+
+      <!-- Four fixed upward lidars at the wheel locations. The ray axis is +Z. -->
+      <sensor name="cart_lidar_fr" type="gpu_lidar">
+        <gz_frame_id>cart_lidar_fr</gz_frame_id>
+        <pose>0.09 0.055 0.080 0 -1.5707963 0</pose>
+        <update_rate>20</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.005</min><max>5.0</max><resolution>0.001</resolution></range>
+          <noise><type>gaussian</type><mean>0</mean><stddev>0.002</stddev></noise>
+        </ray>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+      <sensor name="cart_lidar_fl" type="gpu_lidar">
+        <gz_frame_id>cart_lidar_fl</gz_frame_id>
+        <pose>0.09 -0.055 0.080 0 -1.5707963 0</pose>
+        <update_rate>20</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.005</min><max>5.0</max><resolution>0.001</resolution></range>
+          <noise><type>gaussian</type><mean>0</mean><stddev>0.002</stddev></noise>
+        </ray>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+      <sensor name="cart_lidar_rr" type="gpu_lidar">
+        <gz_frame_id>cart_lidar_rr</gz_frame_id>
+        <pose>-0.09 0.055 0.080 0 -1.5707963 0</pose>
+        <update_rate>20</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.005</min><max>5.0</max><resolution>0.001</resolution></range>
+          <noise><type>gaussian</type><mean>0</mean><stddev>0.002</stddev></noise>
+        </ray>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+      <sensor name="cart_lidar_rl" type="gpu_lidar">
+        <gz_frame_id>cart_lidar_rl</gz_frame_id>
+        <pose>-0.09 -0.055 0.080 0 -1.5707963 0</pose>
+        <update_rate>20</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.005</min><max>5.0</max><resolution>0.001</resolution></range>
+          <noise><type>gaussian</type><mean>0</mean><stddev>0.002</stddev></noise>
+        </ray>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
     </link>
     <joint name="cart_chassis_joint" type="fixed">
       <parent>base_link</parent>
@@ -100,14 +217,14 @@
     <link name="cart_wheel_0">
       <pose relative_to="cart_chassis">0.09 0.055 0.045 -1.5707 0 0</pose>
       <inertial>
-        <mass>0.05</mass>
+        <mass>0.001</mass>
         <inertia>
-          <ixx>1.29e-5</ixx>
+          <ixx>2.58e-7</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>1.29e-5</iyy>
+          <iyy>2.58e-7</iyy>
           <iyz>0</iyz>
-          <izz>2.25e-5</izz>
+          <izz>4.5e-7</izz>
         </inertia>
       </inertial>
       <visual name="cart_wheel_0_visual">
@@ -161,14 +278,14 @@
     <link name="cart_wheel_1">
       <pose relative_to="cart_chassis">0.09 -0.055 0.045 -1.5707 0 0</pose>
       <inertial>
-        <mass>0.05</mass>
+        <mass>0.001</mass>
         <inertia>
-          <ixx>1.29e-5</ixx>
+          <ixx>2.58e-7</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>1.29e-5</iyy>
+          <iyy>2.58e-7</iyy>
           <iyz>0</iyz>
-          <izz>2.25e-5</izz>
+          <izz>4.5e-7</izz>
         </inertia>
       </inertial>
       <visual name="cart_wheel_1_visual">
@@ -222,14 +339,14 @@
     <link name="cart_wheel_2">
       <pose relative_to="cart_chassis">-0.09 0.055 0.045 -1.5707 0 0</pose>
       <inertial>
-        <mass>0.05</mass>
+        <mass>0.001</mass>
         <inertia>
-          <ixx>1.29e-5</ixx>
+          <ixx>2.58e-7</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>1.29e-5</iyy>
+          <iyy>2.58e-7</iyy>
           <iyz>0</iyz>
-          <izz>2.25e-5</izz>
+          <izz>4.5e-7</izz>
         </inertia>
       </inertial>
       <visual name="cart_wheel_2_visual">
@@ -283,14 +400,14 @@
     <link name="cart_wheel_3">
       <pose relative_to="cart_chassis">-0.09 -0.055 0.045 -1.5707 0 0</pose>
       <inertial>
-        <mass>0.05</mass>
+        <mass>0.001</mass>
         <inertia>
-          <ixx>1.29e-5</ixx>
+          <ixx>2.58e-7</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>1.29e-5</iyy>
+          <iyy>2.58e-7</iyy>
           <iyz>0</iyz>
-          <izz>2.25e-5</izz>
+          <izz>4.5e-7</izz>
         </inertia>
       </inertial>
       <visual name="cart_wheel_3_visual">
