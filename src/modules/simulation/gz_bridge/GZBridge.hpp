@@ -59,6 +59,7 @@
 #include <uORB/topics/differential_pressure.h>
 #include <uORB/topics/sensor_gps.h>
 #include <uORB/topics/sensor_optical_flow.h>
+#include <uORB/topics/top_distance.h>
 #include <uORB/topics/obstacle_distance.h>
 #include <uORB/topics/wheel_encoders.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
@@ -81,6 +82,8 @@
 #include <gz/msgs/scene.pb.h>
 // Custom PX4 proto
 #include <opticalflow.pb.h>
+
+#include <pthread.h>
 
 using namespace time_literals;
 
@@ -121,6 +124,7 @@ private:
 	bool subscribeAirPressure(bool required);
 	bool subscribeNavsat(bool required);
 	bool subscribeOpticalFlow(bool required);
+	bool subscribeTopDistance(bool required);
 
 	void clockCallback(const gz::msgs::Clock &msg);
 	void airspeedCallback(const gz::msgs::AirSpeed &msg);
@@ -133,6 +137,11 @@ private:
 	void laserScanCallback(const gz::msgs::LaserScan &msg);
 	void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
 	void magnetometerCallback(const gz::msgs::Magnetometer &msg);
+	void cartLidarFrontRightCallback(const gz::msgs::LaserScan &msg);
+	void cartLidarFrontLeftCallback(const gz::msgs::LaserScan &msg);
+	void cartLidarRearRightCallback(const gz::msgs::LaserScan &msg);
+	void cartLidarRearLeftCallback(const gz::msgs::LaserScan &msg);
+	void topDistanceCallback(const gz::msgs::LaserScan &msg, uint8_t sensor_id);
 
 	static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
@@ -159,6 +168,12 @@ private:
 	uORB::PublicationMulti<sensor_gps_s>          _sensor_gps_pub{ORB_ID(sensor_gps)};
 	uORB::PublicationMulti<vehicle_odometry_s>    _visual_odometry_pub{ORB_ID(vehicle_visual_odometry)};
 	uORB::PublicationMulti<sensor_optical_flow_s> _optical_flow_pub{ORB_ID(sensor_optical_flow)};
+	uORB::Publication<top_distance_s>             _top_distance_pub{ORB_ID(top_distance)};
+
+	pthread_mutex_t _top_distance_mutex{};
+	top_distance_s _top_distance{};
+	uint8_t _top_distance_received_mask{0};
+	uint32_t _top_distance_frames{0};
 
 
 	GZMixingInterfaceESC   _mixing_interface_esc{_node};

@@ -191,10 +191,17 @@ if [ -n "${PX4_SIM_MODEL#*gz_}" ] && [ -z "${PX4_GZ_MODEL_NAME}" ]; then
 
 		echo "INFO  [init] Setting camera to follow ${MODEL_NAME_INSTANCE}"
 
-		# Set default camera offset if not specified
-		follow_x=${PX4_GZ_FOLLOW_OFFSET_X:--2.0}
-		follow_y=${PX4_GZ_FOLLOW_OFFSET_Y:--2.0}
-		follow_z=${PX4_GZ_FOLLOW_OFFSET_Z:-2.0}
+		# Keep the x500_cart camera below the canopy slab when it reaches the roof.
+		# This gives a side-rear view at approximately the same height as the vehicle.
+		if [ "${PX4_SIM_MODEL}" = "x500_cart" ] || [ "${PX4_SIM_MODEL}" = "gz_x500_cart" ]; then
+			follow_x=${PX4_GZ_FOLLOW_OFFSET_X:--3.0}
+			follow_y=${PX4_GZ_FOLLOW_OFFSET_Y:--3.0}
+			follow_z=${PX4_GZ_FOLLOW_OFFSET_Z:-0.0}
+		else
+			follow_x=${PX4_GZ_FOLLOW_OFFSET_X:--2.0}
+			follow_y=${PX4_GZ_FOLLOW_OFFSET_Y:--2.0}
+			follow_z=${PX4_GZ_FOLLOW_OFFSET_Z:-2.0}
+		fi
 
 		# Set camera offset
 		${gz_command} topic -t /gui/track -m gz.msgs.CameraTrack \

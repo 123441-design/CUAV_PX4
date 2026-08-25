@@ -22,7 +22,7 @@ uint8 REASON_SENSOR_TIMEOUT = 4
 uint8 REASON_ESTIMATOR = 5
 uint8 REASON_HEADING_RESET = 6
 uint8 REASON_LAND = 7
-uint8 REASON_TOP_CONTACT = 8
+uint8 REASON_TOP_DISTANCE = 8
 
 uint8 state
 bool active
@@ -30,4 +30,3 @@ uint8 action
 uint8 control_owner
 uint16 handover_id
 uint8 reason
-

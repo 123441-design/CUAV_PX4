@@ -45,7 +45,7 @@
 #include <uORB/topics/custom_action_status.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
-#include <uORB/topics/top_contact.h>
+#include <uORB/topics/top_distance.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
 #include <uORB/topics/vehicle_control_mode.h>
@@ -109,8 +109,8 @@ private:
 	void handleCommandLong(const mavlink_message_t &message);
 	void handleCustomActionCommand(const mavlink_message_t &message,
 				       const mavlink_command_long_t &command);
-	void handleTopContactPing(const mavlink_message_t &message,
-				  const mavlink_ping_t &ping);
+	void handleTopDistancePing(const mavlink_message_t &message,
+				   const mavlink_ping_t &ping);
 	void handleMotorTestCommand(const mavlink_message_t &message,
 				    const mavlink_command_long_t &command);
 	void handleOffboardModeCommand(const mavlink_message_t &message,
@@ -148,7 +148,7 @@ private:
 	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
-	uORB::Publication<top_contact_s> _top_contact_pub{ORB_ID(top_contact)};
+	uORB::Publication<top_distance_s> _top_distance_pub{ORB_ID(top_distance)};
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
 	perf_counter_t _loop_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")};
@@ -179,9 +179,9 @@ private:
 	uint32_t _trajectory_setpoints_published{0};
 	uint32_t _offboard_mode_requests{0};
 	uint32_t _custom_action_commands{0};
-	uint32_t _top_contact_reports{0};
-	uint32_t _invalid_top_contact_reports{0};
-	uint32_t _duplicate_top_contact_reports{0};
+	uint32_t _top_distance_reports{0};
+	uint32_t _invalid_top_distance_reports{0};
+	uint32_t _duplicate_top_distance_reports{0};
 	uint32_t _legacy_setpoints_blocked{0};
 	uint32_t _relayed_command_acks{0};
 	uint32_t _invalid_setpoints{0};
@@ -209,10 +209,12 @@ private:
 	uint16_t _remote_component{0};
 	uint32_t _event_flags{EventNone};
 	uint16_t _latest_event_command{0};
-	uint16_t _last_top_contact_sequence{0};
-	uint8_t _last_top_contact_system{0};
-	uint8_t _last_top_contact_component{0};
-	bool _top_contact_sequence_valid{false};
+	top_distance_s _pending_top_distance{};
+	uint16_t _pending_top_distance_sequence{0};
+	uint8_t _pending_top_distance_received_mask{0};
+	uint8_t _pending_top_distance_system{0};
+	uint8_t _pending_top_distance_component{0};
+	bool _pending_top_distance_valid{false};
 	bool _direct_motor_active{false};
 	bool _direct_motor_stopping{false};
 	float _motor_throttle_percent{0.f};

@@ -35,9 +35,19 @@ parameters:
         max: 30.0
         default: 10.0
         decimal: 1
+      CUST_TOP_GAP:
+        description:
+          short: Top-distance threshold
+          long: The minimum of the four measured upward distances must remain below this threshold for four complete frames before entering TOP_HOLD.
+        type: float
+        unit: m
+        min: 0.01
+        max: 0.50
+        default: 0.08
+        decimal: 3
       CUST_SENS_TO:
         description:
-          short: Top-contact data timeout
+          short: Top-distance data timeout
         type: float
         unit: s
         min: 0.10

@@ -7,14 +7,13 @@
 
 #include <px4_platform_common/module.h>
 #include <px4_platform_common/module_params.h>
-#include <px4_platform_common/atomic.h>
 #include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
 
 #include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/custom_action_status.h>
 #include <uORB/topics/offboard_control_mode.h>
-#include <uORB/topics/top_contact.h>
+#include <uORB/topics/top_distance.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
@@ -34,7 +33,6 @@ public:
 
 	bool init();
 	int print_status() override;
-	void setTestContact(int mode);
 	static int publishTestCommand(int action, int value, int request_id);
 
 private:
@@ -52,27 +50,26 @@ private:
 	bool flightStateAllowsCustom() const;
 	bool localStateValid() const;
 	bool sensorFresh(hrt_abstime now) const;
+	bool topDistanceTriggered() const;
 	void publishControlSetpoint(hrt_abstime now);
 	void publishStatus(bool force = false);
 	void publishAck(const vehicle_command_s &command, uint8_t result, uint8_t project_result);
 	void publishAsyncAck(uint8_t result, uint8_t project_result, uint16_t request_id,
 			     uint8_t target_system, uint16_t target_component);
-	void updateTestContact(hrt_abstime now);
 
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
-	uORB::Subscription _top_contact_sub{ORB_ID(top_contact)};
+	uORB::Subscription _top_distance_sub{ORB_ID(top_distance)};
 
 	uORB::Publication<custom_action_status_s> _status_pub{ORB_ID(custom_action_status)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
 	uORB::Publication<vehicle_command_ack_s> _vehicle_command_ack_pub{ORB_ID(vehicle_command_ack)};
-	uORB::Publication<top_contact_s> _test_top_contact_pub{ORB_ID(top_contact)};
 
 	vehicle_local_position_s _local_position{};
 	vehicle_status_s _vehicle_status{};
-	top_contact_s _top_contact{};
+	top_distance_s _top_distance{};
 
 	uint8_t _state{custom_action_status_s::STATE_INACTIVE};
 	uint8_t _owner{custom_action_status_s::OWNER_LEGACY};
@@ -89,18 +86,17 @@ private:
 	float _start_z{0.f};
 	uint8_t _heading_reset_counter{0};
 	hrt_abstime _search_started{0};
-	uint64_t _last_top_contact_timestamp{0};
+	uint16_t _last_top_distance_sequence{0};
 	uint8_t _contact_confirm_count{0};
 	hrt_abstime _handover_started{0};
 	hrt_abstime _last_status_publish{0};
-
-	px4::atomic<int> _test_contact_mode{-1}; // -1 disabled, 0/1 valid, 2 invalid
 
 	DEFINE_PARAMETERS(
 		(ParamBool<px4::params::CUST_TOP_EN>) _param_enabled,
 		(ParamFloat<px4::params::CUST_TOP_VEL>) _param_top_velocity,
 		(ParamFloat<px4::params::CUST_TOP_DIST>) _param_top_distance,
 		(ParamFloat<px4::params::CUST_TOP_TIME>) _param_top_time,
+		(ParamFloat<px4::params::CUST_TOP_GAP>) _param_top_gap,
 		(ParamFloat<px4::params::CUST_SENS_TO>) _param_sensor_timeout,
 		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout
 	)

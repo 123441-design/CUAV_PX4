@@ -41,6 +41,7 @@
 #include <px4_platform_common/getopt.h>
 
 #include <iostream>
+#include <cmath>
 #include <string>
 
 ModuleBase::Descriptor GZBridge::desc{task_spawn, custom_command, print_usage};
@@ -51,6 +52,7 @@ GZBridge::GZBridge(const std::string &world, const std::string &model_name) :
 	_world_name(world),
 	_model_name(model_name)
 {
+	pthread_mutex_init(&_top_distance_mutex, nullptr);
 	updateParams();
 }
 
@@ -59,6 +61,8 @@ GZBridge::~GZBridge()
 	for (auto &sub_topic : _node.SubscribedTopics()) {
 		_node.Unsubscribe(sub_topic);
 	}
+
+	pthread_mutex_destroy(&_top_distance_mutex);
 }
 
 int GZBridge::init()
@@ -122,6 +126,14 @@ int GZBridge::init()
 
 	if (_sim_gz_en_flow.get()) {
 		if (!subscribeOpticalFlow(false)) {
+			return PX4_ERROR;
+		}
+	}
+
+	// x500_cart carries four fixed upward single-beam range sensors. Their
+	// measured Gazebo ranges go straight to PX4; no GUI or UDP relay is needed.
+	if (_model_name.rfind("x500_cart", 0) == 0) {
+		if (!subscribeTopDistance(true)) {
 			return PX4_ERROR;
 		}
 	}
@@ -338,6 +350,29 @@ bool GZBridge::subscribeOpticalFlow(bool required)
 	return true;
 }
 
+bool GZBridge::subscribeTopDistance(bool required)
+{
+	const std::string topic_prefix = "/world/" + _world_name + "/model/" + _model_name
+					 + "/link/cart_chassis/sensor/";
+
+	const bool front_right = _node.Subscribe(topic_prefix + "cart_lidar_fr/scan",
+				 &GZBridge::cartLidarFrontRightCallback, this);
+	const bool front_left = _node.Subscribe(topic_prefix + "cart_lidar_fl/scan",
+				&GZBridge::cartLidarFrontLeftCallback, this);
+	const bool rear_right = _node.Subscribe(topic_prefix + "cart_lidar_rr/scan",
+				&GZBridge::cartLidarRearRightCallback, this);
+	const bool rear_left = _node.Subscribe(topic_prefix + "cart_lidar_rl/scan",
+			       &GZBridge::cartLidarRearLeftCallback, this);
+
+	if (!(front_right && front_left && rear_right && rear_left)) {
+		PX4_ERR("failed to subscribe to x500_cart top-distance sensors");
+		return required ? false : true;
+	}
+
+	PX4_INFO("four x500_cart top-distance sensors connected directly to PX4");
+	return true;
+}
+
 void GZBridge::clockCallback(const gz::msgs::Clock &msg)
 {
 	// NOTE: PX4-SITL time needs to stay in sync with gz, so this clock-sync will happen on every callback.
@@ -375,10 +410,10 @@ void GZBridge::opticalFlowCallback(const px4::msgs::OpticalFlow &msg)
 	id.devid_s.devtype = DRV_FLOW_DEVTYPE_SIM;
 	report.device_id = id.devid;
 
-	// values taken from PAW3902
+	// Values match the PAA3905 used by the Holybro H-Flow.
 	report.mode = sensor_optical_flow_s::MODE_LOWLIGHT;
 	report.max_flow_rate = 7.4f;
-	report.min_ground_distance = 0.f;
+	report.min_ground_distance = 0.08f;
 	report.max_ground_distance = 30.f;
 	report.error_count = 0;
 
@@ -388,6 +423,71 @@ void GZBridge::opticalFlowCallback(const px4::msgs::OpticalFlow &msg)
 	// Distance will come from vehicle distance sensor
 
 	_optical_flow_pub.publish(report);
+}
+
+void GZBridge::cartLidarFrontRightCallback(const gz::msgs::LaserScan &msg)
+{
+	topDistanceCallback(msg, 0);
+}
+
+void GZBridge::cartLidarFrontLeftCallback(const gz::msgs::LaserScan &msg)
+{
+	topDistanceCallback(msg, 1);
+}
+
+void GZBridge::cartLidarRearRightCallback(const gz::msgs::LaserScan &msg)
+{
+	topDistanceCallback(msg, 2);
+}
+
+void GZBridge::cartLidarRearLeftCallback(const gz::msgs::LaserScan &msg)
+{
+	topDistanceCallback(msg, 3);
+}
+
+void GZBridge::topDistanceCallback(const gz::msgs::LaserScan &msg, uint8_t sensor_id)
+{
+	if (sensor_id >= 4) {
+		return;
+	}
+
+	const hrt_abstime now = hrt_absolute_time();
+	float distance = NAN;
+
+	if (msg.ranges_size() > 0) {
+		const float measured = static_cast<float>(msg.ranges(0));
+		const float range_min = static_cast<float>(msg.range_min());
+		const float range_max = static_cast<float>(msg.range_max());
+
+		if (std::isfinite(measured) && measured >= range_min && measured < range_max) {
+			distance = measured;
+		}
+	}
+
+	pthread_mutex_lock(&_top_distance_mutex);
+
+	if (_top_distance_received_mask == 0) {
+		_top_distance.valid_mask = 0;
+	}
+
+	const uint8_t sensor_bit = 1u << sensor_id;
+	_top_distance.timestamp_sample[sensor_id] = now;
+	_top_distance.distance_m[sensor_id] = distance;
+
+	if (std::isfinite(distance)) {
+		_top_distance.valid_mask |= sensor_bit;
+	}
+
+	_top_distance_received_mask |= sensor_bit;
+
+	if (_top_distance_received_mask == 0x0F) {
+		_top_distance.timestamp = now;
+		_top_distance.sequence = static_cast<uint16_t>(++_top_distance_frames);
+		_top_distance_pub.publish(_top_distance);
+		_top_distance_received_mask = 0;
+	}
+
+	pthread_mutex_unlock(&_top_distance_mutex);
 }
 
 void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
@@ -947,6 +1047,14 @@ int GZBridge::task_spawn(int argc, char *argv[])
 
 int GZBridge::print_status()
 {
+	pthread_mutex_lock(&_top_distance_mutex);
+	const uint32_t top_distance_frames = _top_distance_frames;
+	const uint8_t top_distance_valid_mask = _top_distance.valid_mask;
+	pthread_mutex_unlock(&_top_distance_mutex);
+
+	PX4_INFO("Direct top distance: frames=%" PRIu32 " valid_mask=0x%02x",
+		 top_distance_frames, top_distance_valid_mask);
+
 	PX4_INFO_RAW("ESC outputs:\n");
 	_mixing_interface_esc.mixingOutput().printStatus();
 

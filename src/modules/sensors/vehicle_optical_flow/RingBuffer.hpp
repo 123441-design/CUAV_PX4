@@ -75,12 +75,17 @@ public:
 
 	bool peak_first_older_than(const uint64_t &timestamp, T *sample)
 	{
+		if (_first_write) {
+			return false;
+		}
+
 		// start looking from newest observation data
 		for (size_t i = 0; i < SIZE; i++) {
 			int index = static_cast<int>(_head) - static_cast<int>(i);
 			index = index < 0 ? static_cast<int>(SIZE) + index : index;
 
-			if (timestamp >= _buffer[index].time_us && timestamp < _buffer[index].time_us + (uint64_t)100'000) {
+			if (_buffer[index].time_us != 0 && timestamp >= _buffer[index].time_us
+			    && timestamp < _buffer[index].time_us + (uint64_t)100'000) {
 				*sample = _buffer[index];
 				return true;
 			}
@@ -97,12 +102,17 @@ public:
 
 	bool pop_first_older_than(const uint64_t &timestamp, T *sample)
 	{
+		if (_first_write) {
+			return false;
+		}
+
 		// start looking from newest observation data
 		for (size_t i = 0; i < SIZE; i++) {
 			int index = static_cast<int>(_head) - static_cast<int>(i);
 			index = index < 0 ? static_cast<int>(SIZE) + index : index;
 
-			if (timestamp >= _buffer[index].time_us && timestamp < _buffer[index].time_us + (uint64_t)100'000) {
+			if (_buffer[index].time_us != 0 && timestamp >= _buffer[index].time_us
+			    && timestamp < _buffer[index].time_us + (uint64_t)100'000) {
 				*sample = _buffer[index];
 
 				// Now we can set the tail to the item which
@@ -133,7 +143,7 @@ public:
 
 	bool pop_oldest(const uint64_t &timestamp_oldest, const uint64_t &timestamp_newest, T *sample)
 	{
-		if (timestamp_oldest >= timestamp_newest) {
+		if (_first_write || timestamp_oldest >= timestamp_newest) {
 			return false;
 		}
 
@@ -141,7 +151,8 @@ public:
 
 			size_t index = (_tail + i) % SIZE;
 
-			if (_buffer[index].time_us >= timestamp_oldest && _buffer[index].time_us <= timestamp_newest) {
+			if (_buffer[index].time_us != 0 && _buffer[index].time_us >= timestamp_oldest
+			    && _buffer[index].time_us <= timestamp_newest) {
 				*sample = _buffer[index];
 
 				// Now we can set the tail to the item which

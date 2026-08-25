@@ -272,7 +272,7 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	_handled_messages++;
 
 	if (ping.target_component == custom_action_protocol::kComponentId) {
-		handleTopContactPing(message, ping);
+		handleTopDistancePing(message, ping);
 		return;
 	}
 
@@ -293,7 +293,7 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	sendMavlinkMessage(response);
 }
 
-void MylinkBridge::handleTopContactPing(const mavlink_message_t &message,
+void MylinkBridge::handleTopDistancePing(const mavlink_message_t &message,
 		const mavlink_ping_t &ping)
 {
 	vehicle_status_s status{};
@@ -305,29 +305,64 @@ void MylinkBridge::handleTopContactPing(const mavlink_message_t &message,
 	}
 
 	const uint32_t encoded = ping.seq;
-	const bool valid = (encoded & custom_action_protocol::kTopContactPingValidMask) != 0;
-	const bool contact = (encoded & custom_action_protocol::kTopContactPingContactMask) != 0;
-	const uint32_t sequence = encoded & custom_action_protocol::kTopContactPingSequenceMask;
 
-	if (_top_contact_sequence_valid
-	    && message.sysid == _last_top_contact_system
-	    && message.compid == _last_top_contact_component
-	    && sequence == _last_top_contact_sequence) {
-		_duplicate_top_contact_reports++;
+	if ((encoded & custom_action_protocol::kTopDistancePingVersionMask) == 0) {
+		_invalid_top_distance_reports++;
 		return;
 	}
 
-	top_contact_s report{};
-	report.timestamp = hrt_absolute_time();
-	report.valid = valid;
-	report.contact = valid && contact;
-	_top_contact_pub.publish(report);
+	const uint8_t sensor_id = static_cast<uint8_t>(
+		(encoded & custom_action_protocol::kTopDistancePingSensorMask) >> 29);
+	const uint16_t sequence = static_cast<uint16_t>(
+		(encoded & custom_action_protocol::kTopDistancePingSequenceMask) >> 16);
+	const uint16_t distance_mm = static_cast<uint16_t>(
+		encoded & custom_action_protocol::kTopDistancePingMillimetresMask);
+	const bool valid = (encoded & custom_action_protocol::kTopDistancePingValidMask) != 0
+			   && distance_mm > 0;
 
-	_last_top_contact_sequence = sequence;
-	_last_top_contact_system = message.sysid;
-	_last_top_contact_component = message.compid;
-	_top_contact_sequence_valid = true;
-	_top_contact_reports++;
+	if (sensor_id >= custom_action_protocol::kTopDistanceSensorCount) {
+		_invalid_top_distance_reports++;
+		return;
+	}
+
+	if (!_pending_top_distance_valid || sequence != _pending_top_distance_sequence
+	    || message.sysid != _pending_top_distance_system
+	    || message.compid != _pending_top_distance_component) {
+		_pending_top_distance = {};
+		_pending_top_distance_sequence = sequence;
+		_pending_top_distance_system = message.sysid;
+		_pending_top_distance_component = message.compid;
+		_pending_top_distance_received_mask = 0;
+		_pending_top_distance_valid = true;
+	}
+
+	const uint8_t sensor_bit = 1u << sensor_id;
+
+	if ((_pending_top_distance_received_mask & sensor_bit) != 0) {
+		_duplicate_top_distance_reports++;
+		return;
+	}
+
+	const hrt_abstime now = hrt_absolute_time();
+	_pending_top_distance.timestamp_sample[sensor_id] = now;
+	_pending_top_distance.distance_m[sensor_id] = valid ? distance_mm * 0.001f : NAN;
+
+	if (valid) {
+		_pending_top_distance.valid_mask |= sensor_bit;
+	}
+
+	_pending_top_distance_received_mask |= sensor_bit;
+
+	if (_pending_top_distance_received_mask == (1u << custom_action_protocol::kTopDistanceSensorCount) - 1u) {
+		_pending_top_distance.timestamp = now;
+		_pending_top_distance.sequence = sequence;
+		_top_distance_pub.publish(_pending_top_distance);
+		_top_distance_reports++;
+
+		if (_pending_top_distance.valid_mask != _pending_top_distance_received_mask) {
+			_invalid_top_distance_reports++;
+		}
+	}
 }
 
 void MylinkBridge::handleHeartbeat(const mavlink_message_t &message)
@@ -707,7 +742,9 @@ void MylinkBridge::clearSessionState()
 	_event_flags = EventNone;
 	_latest_event_command = 0;
 	_commander_owns_control = false;
-	_top_contact_sequence_valid = false;
+	_pending_top_distance = {};
+	_pending_top_distance_received_mask = 0;
+	_pending_top_distance_valid = false;
 	_session_resets++;
 }
 
@@ -1125,8 +1162,8 @@ int MylinkBridge::print_status()
 		 " ack_relayed=%" PRIu32,
 		 _custom_action_commands, _custom_action_status.control_owner, _custom_action_status.state,
 		 _custom_action_status.handover_id, _legacy_setpoints_blocked, _relayed_command_acks);
-	PX4_INFO("top_contact: reports=%" PRIu32 " invalid=%" PRIu32 " duplicate=%" PRIu32,
-		 _top_contact_reports, _invalid_top_contact_reports, _duplicate_top_contact_reports);
+	PX4_INFO("top_distance: frames=%" PRIu32 " invalid=%" PRIu32 " duplicate=%" PRIu32,
+		 _top_distance_reports, _invalid_top_distance_reports, _duplicate_top_distance_reports);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,

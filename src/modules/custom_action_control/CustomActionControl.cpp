@@ -34,7 +34,7 @@ const char *reasonName(uint8_t reason)
 	case custom_action_status_s::REASON_ESTIMATOR: return "estimator invalid";
 	case custom_action_status_s::REASON_HEADING_RESET: return "heading reset";
 	case custom_action_status_s::REASON_LAND: return "land";
-	case custom_action_status_s::REASON_TOP_CONTACT: return "top contact";
+	case custom_action_status_s::REASON_TOP_DISTANCE: return "top distance";
 	default: return "none";
 	}
 }
@@ -81,8 +81,32 @@ bool CustomActionControl::flightStateAllowsCustom() const
 bool CustomActionControl::sensorFresh(hrt_abstime now) const
 {
 	const hrt_abstime timeout = static_cast<hrt_abstime>(_param_sensor_timeout.get() * 1_s);
-	return _top_contact.valid && _top_contact.timestamp != 0 && now >= _top_contact.timestamp
-	       && now - _top_contact.timestamp <= timeout;
+
+	if (_top_distance.valid_mask != 0x0F || _top_distance.timestamp == 0
+	    || now < _top_distance.timestamp || now - _top_distance.timestamp > timeout) {
+		return false;
+	}
+
+	for (uint8_t sensor = 0; sensor < 4; ++sensor) {
+		if (_top_distance.timestamp_sample[sensor] == 0 || now < _top_distance.timestamp_sample[sensor]
+		    || now - _top_distance.timestamp_sample[sensor] > timeout
+		    || !PX4_ISFINITE(_top_distance.distance_m[sensor])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool CustomActionControl::topDistanceTriggered() const
+{
+	float minimum_distance = INFINITY;
+
+	for (float distance : _top_distance.distance_m) {
+		minimum_distance = math::min(minimum_distance, distance);
+	}
+
+	return PX4_ISFINITE(minimum_distance) && minimum_distance <= _param_top_gap.get();
 }
 
 bool CustomActionControl::captureHoldPoint()
@@ -124,7 +148,7 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	const hrt_abstime now = hrt_absolute_time();
 
 	if (_owner != custom_action_status_s::OWNER_LEGACY || _state != custom_action_status_s::STATE_INACTIVE
-	    || !flightStateAllowsCustom() || !sensorFresh(now) || _top_contact.contact || !captureHoldPoint()) {
+	    || !flightStateAllowsCustom() || !sensorFresh(now) || topDistanceTriggered() || !captureHoldPoint()) {
 		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
 			   static_cast<uint8_t>(Result::None));
 		return;
@@ -140,7 +164,7 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	_start_z = _hold_z;
 	_heading_reset_counter = _local_position.heading_reset_counter;
 	_search_started = now;
-	_last_top_contact_timestamp = _top_contact.timestamp;
+	_last_top_distance_sequence = _top_distance.sequence;
 	_contact_confirm_count = 0;
 	_handover_started = 0;
 	PX4_INFO("[SEARCH_TOP] entered xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
@@ -269,10 +293,9 @@ void CustomActionControl::enterTopHold()
 
 	_state = custom_action_status_s::STATE_TOP_HOLD;
 	_owner = custom_action_status_s::OWNER_CUSTOM;
-	_reason = custom_action_status_s::REASON_TOP_CONTACT;
-	_test_contact_mode.store(-1);
+	_reason = custom_action_status_s::REASON_TOP_DISTANCE;
 	_contact_confirm_count = 0;
-	PX4_INFO("[SEARCH_TOP] top sensor triggered");
+	PX4_INFO("[SEARCH_TOP] top distance threshold reached");
 	PX4_INFO("[TOP_HOLD] entered z=%.2f", (double)_hold_z);
 	publishStatus(true);
 	publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
@@ -289,7 +312,6 @@ void CustomActionControl::releaseToLegacy(uint8_t reason)
 	_search_started = 0;
 	_handover_started = 0;
 	_contact_confirm_count = 0;
-	_test_contact_mode.store(-1);
 	publishStatus(true);
 }
 
@@ -302,7 +324,6 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 	_search_started = 0;
 	_handover_started = 0;
 	_contact_confirm_count = 0;
-	_test_contact_mode.store(-1);
 	PX4_INFO("[CUSTOM] control released to Commander: %s", reasonName(reason));
 	publishStatus(true);
 }
@@ -354,21 +375,6 @@ void CustomActionControl::publishStatus(bool force)
 	_last_status_publish = now;
 }
 
-void CustomActionControl::updateTestContact(hrt_abstime now)
-{
-	const int mode = _test_contact_mode.load();
-
-	if (mode < 0) {
-		return;
-	}
-
-	top_contact_s contact{};
-	contact.timestamp = now;
-	contact.valid = mode != 2;
-	contact.contact = mode == 1;
-	_test_top_contact_pub.publish(contact);
-}
-
 void CustomActionControl::Run()
 {
 	if (should_exit()) {
@@ -379,10 +385,9 @@ void CustomActionControl::Run()
 
 	updateParams();
 	const hrt_abstime now = hrt_absolute_time();
-	updateTestContact(now);
 	_vehicle_local_position_sub.update(&_local_position);
 	_vehicle_status_sub.update(&_vehicle_status);
-	const bool top_contact_updated = _top_contact_sub.update(&_top_contact);
+	const bool top_distance_updated = _top_distance_sub.update(&_top_distance);
 
 	vehicle_command_s command{};
 
@@ -429,16 +434,15 @@ void CustomActionControl::Run()
 			beginHandover(custom_action_status_s::REASON_TIMEOUT, _active_request_id,
 				      _active_source_system, _active_source_component, true);
 
-		} else if (top_contact_updated) {
-			// Count only fresh, timestamp-advancing samples. A single contact
-			// packet is only a candidate; four consecutive valid samples are
-			// required before declaring TOP_HOLD.
-			if (_top_contact.timestamp <= _last_top_contact_timestamp
-			    || !_top_contact.valid || !_top_contact.contact) {
+		} else if (top_distance_updated) {
+			// Contact is decided inside PX4 from raw measured distance. Four
+			// consecutive complete frames below the gap threshold are required.
+			if (_top_distance.sequence == _last_top_distance_sequence
+			    || !topDistanceTriggered()) {
 				_contact_confirm_count = 0;
 
 			} else {
-				_last_top_contact_timestamp = _top_contact.timestamp;
+				_last_top_distance_sequence = _top_distance.sequence;
 				_contact_confirm_count++;
 
 				if (_contact_confirm_count >= kRequiredContactSamples) {
@@ -459,12 +463,6 @@ void CustomActionControl::Run()
 	}
 
 	publishStatus();
-}
-
-void CustomActionControl::setTestContact(int mode)
-{
-	_test_contact_mode.store(mode);
-	PX4_WARN("TEST ONLY top_contact mode=%d", mode);
 }
 
 int CustomActionControl::publishTestCommand(int action, int value, int request_id)
@@ -507,28 +505,6 @@ int CustomActionControl::task_spawn(int argc, char *argv[])
 
 int CustomActionControl::custom_command(int argc, char *argv[])
 {
-	if (argc >= 1 && !strcmp(argv[0], "test_contact")) {
-		CustomActionControl *instance = get_instance<CustomActionControl>(desc);
-
-		if (instance == nullptr || argc < 2) {
-			return print_usage("start module first; test_contact requires 0, 1, invalid or clear");
-		}
-
-		if (!strcmp(argv[1], "0")) {
-			instance->setTestContact(0);
-		} else if (!strcmp(argv[1], "1")) {
-			instance->setTestContact(1);
-		} else if (!strcmp(argv[1], "invalid")) {
-			instance->setTestContact(2);
-		} else if (!strcmp(argv[1], "clear")) {
-			instance->setTestContact(-1);
-		} else {
-			return print_usage("unknown TEST ONLY contact value");
-		}
-
-		return PX4_OK;
-	}
-
 	if (argc >= 2 && !strcmp(argv[0], "test_command")) {
 		if (!strcmp(argv[1], "search") && argc >= 3) {
 			return publishTestCommand(static_cast<int>(Command::SearchTop), 0, atoi(argv[2]));
@@ -550,8 +526,8 @@ int CustomActionControl::custom_command(int argc, char *argv[])
 
 int CustomActionControl::print_status()
 {
-	PX4_INFO("state=%u owner=%u reason=%u handover_id=%u test_contact=%d",
-		 _state, _owner, _reason, _handover_id, _test_contact_mode.load());
+	PX4_INFO("state=%u owner=%u reason=%u handover_id=%u top_seq=%u mask=0x%02x",
+		 _state, _owner, _reason, _handover_id, _top_distance.sequence, _top_distance.valid_mask);
 	PX4_INFO("hold xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z, (double)_locked_yaw);
 	return 0;
@@ -561,7 +537,6 @@ int CustomActionControl::print_usage(const char *reason)
 {
 	PRINT_MODULE_USAGE_NAME("custom_action_control", "controller");
 	PRINT_MODULE_USAGE_COMMAND("start");
-	PRINT_MODULE_USAGE_COMMAND_DESCR("test_contact", "TEST ONLY: 0, 1, invalid or clear");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("test_command", "TEST ONLY: inject project command on vehicle_command");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	return 0;

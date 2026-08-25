@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import math
 import queue
+import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -45,10 +47,12 @@ CUSTOM_RESULT_REBASE_ACCEPTED = 4
 CUSTOM_RESULT_HANDOVER_PENDING = 5
 CUSTOM_RESULT_TOP_HOLD = 6
 SETPOINT_RATE_HZ = 10.0
-TOP_CONTACT_REPORT_RATE_HZ = 20.0
-TOP_CONTACT_PING_CONTACT_MASK = 1 << 31
-TOP_CONTACT_PING_VALID_MASK = 1 << 30
-TOP_CONTACT_PING_SEQUENCE_MASK = (1 << 30) - 1
+TOP_DISTANCE_UDP_PORT = 14600
+TOP_DISTANCE_MAGIC = b"V3LD"
+TOP_DISTANCE_VERSION = 1
+TOP_DISTANCE_PACKET = struct.Struct("!4sBBHQ4H")
+TOP_DISTANCE_PROTOCOL_MARKER = 1 << 28
+TOP_DISTANCE_VALID_MASK = 1 << 31
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
 Z_MAX_SPEED_UP_M_S = 0.30
@@ -169,9 +173,37 @@ class MyLinkState:
     battery_voltage_v: float | None = None
     heartbeat_age_s: float | None = None
     local_position_age_s: float | None = None
+    top_distances_m: tuple[float | None, float | None, float | None, float | None] = (None, None, None, None)
+    top_distance_age_s: float | None = None
     rx_counts: tuple[tuple[str, int], ...] = ()
     tx_setpoints: int = 0
     error: str = ""
+
+
+@dataclass(frozen=True)
+class TopDistanceFrame:
+    sequence: int
+    timestamp_us: int
+    valid_mask: int
+    distances_mm: tuple[int, int, int, int]
+    received_at: float
+
+
+def decode_top_distance_packet(payload: bytes, received_at: float | None = None) -> TopDistanceFrame:
+    if len(payload) != TOP_DISTANCE_PACKET.size:
+        raise ValueError(f"unexpected lidar packet size {len(payload)}")
+    magic, version, valid_mask, sequence, timestamp_us, *distances_mm = TOP_DISTANCE_PACKET.unpack(payload)
+    if magic != TOP_DISTANCE_MAGIC or version != TOP_DISTANCE_VERSION:
+        raise ValueError("unknown lidar packet protocol")
+    if valid_mask & ~0x0F or sequence & ~0x0FFF:
+        raise ValueError("invalid lidar packet fields")
+    return TopDistanceFrame(
+        sequence=sequence,
+        timestamp_us=timestamp_us,
+        valid_mask=valid_mask,
+        distances_mm=tuple(distances_mm),
+        received_at=time.monotonic() if received_at is None else received_at,
+    )
 
 
 @dataclass(frozen=True)
@@ -544,6 +576,7 @@ class MyLinkMavlinkClient:
         target_system: int = TARGET_SYSTEM,
         target_component: int = TARGET_COMPONENT,
         setpoint_rate_hz: float = SETPOINT_RATE_HZ,
+        lidar_udp_port: int = TOP_DISTANCE_UDP_PORT,
         logger: Callable[[str], None] | None = None,
         trace_logger: Callable[[str], None] | None = None,
     ) -> None:
@@ -553,6 +586,7 @@ class MyLinkMavlinkClient:
         self.target_system = int(target_system)
         self.target_component = int(target_component)
         self.setpoint_rate_hz = float(setpoint_rate_hz)
+        self.lidar_udp_port = int(lidar_udp_port)
         self.log = logger or (lambda _message: None)
         self.trace_log = trace_logger or (lambda _message: None)
 
@@ -589,10 +623,13 @@ class MyLinkMavlinkClient:
         self._rebase_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._search_top_active = False
-        self._top_contact_lock = threading.Lock()
-        self._top_contact_asserted = False
-        self._top_contact_sequence = 0
-        self._top_contact_tx_count = 0
+        self._lidar_socket: socket.socket | None = None
+        self._lidar_lock = threading.Lock()
+        self._top_distance_frame: TopDistanceFrame | None = None
+        self._last_forwarded_top_distance_sequence: int | None = None
+        self._top_distance_rx_count = 0
+        self._top_distance_tx_count = 0
+        self._top_distance_logged = False
 
     def start(self, timeout_s: float = 12.0) -> None:
         if self._connection is not None:
@@ -614,15 +651,21 @@ class MyLinkMavlinkClient:
                 dialect="common",
                 force_connected=True,
             )
+        lidar_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        lidar_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lidar_socket.bind(("0.0.0.0", self.lidar_udp_port))
+        lidar_socket.settimeout(0.2)
+        self._lidar_socket = lidar_socket
         self._stop.clear()
         self._legacy_output_allowed = True
         self._search_top_active = False
-        with self._top_contact_lock:
-            self._top_contact_asserted = False
-            self._top_contact_sequence = 0
+        with self._lidar_lock:
+            self._top_distance_frame = None
+            self._last_forwarded_top_distance_sequence = None
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
+            threading.Thread(target=self._lidar_receive_loop, name="cart-lidar-rx", daemon=True),
         ]
         if self._custom_connection is not None:
             self._threads.append(
@@ -645,6 +688,10 @@ class MyLinkMavlinkClient:
         self._stop.set()
         self._legacy_output_allowed = False
         self.clear_search_top_active()
+        lidar_socket = self._lidar_socket
+        self._lidar_socket = None
+        if lidar_socket is not None:
+            lidar_socket.close()
         for thread in self._threads:
             thread.join(timeout=1.0)
         self._threads.clear()
@@ -665,11 +712,14 @@ class MyLinkMavlinkClient:
             now = time.monotonic()
             heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
             local_age = None if self._last_local_position is None else now - self._last_local_position
+            distances, top_age = self._top_distance_snapshot(now)
             return replace(
                 self._state,
                 connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
                 heartbeat_age_s=heartbeat_age,
                 local_position_age_s=local_age,
+                top_distances_m=distances,
+                top_distance_age_s=top_age,
                 rx_counts=tuple(sorted(self._rx_counts.items())),
                 tx_setpoints=self._setpoint_count,
             )
@@ -695,11 +745,14 @@ class MyLinkMavlinkClient:
         now = time.monotonic()
         heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
         local_age = None if self._last_local_position is None else now - self._last_local_position
+        distances, top_age = self._top_distance_snapshot(now)
         return replace(
             self._state,
             connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
             heartbeat_age_s=heartbeat_age,
             local_position_age_s=local_age,
+            top_distances_m=distances,
+            top_distance_age_s=top_age,
             rx_counts=tuple(sorted(self._rx_counts.items())),
             tx_setpoints=self._setpoint_count,
         )
@@ -863,23 +916,13 @@ class MyLinkMavlinkClient:
         return self.send_project_command(CUSTOM_ACTION_DIRECTION_INTENT, float(direction_id))
 
     def start_search_top(self) -> CommandAck:
-        with self._top_contact_lock:
-            self._top_contact_asserted = False
         return self.send_project_command(CUSTOM_ACTION_SEARCH_TOP)
-
-    def simulate_contact(self) -> None:
-        if not self._search_top_active:
-            raise RuntimeError("模拟激光信号仅可在寻顶模式运行期间发送")
-        with self._top_contact_lock:
-            self._top_contact_asserted = True
 
     def search_top_active(self) -> bool:
         return self._search_top_active
 
     def clear_search_top_active(self) -> None:
         self._search_top_active = False
-        with self._top_contact_lock:
-            self._top_contact_asserted = False
 
     def land(self) -> int:
         self.block_legacy_output()
@@ -912,22 +955,68 @@ class MyLinkMavlinkClient:
         ))
         self._heartbeat_tx_count += 1
 
-    def _send_top_contact_report(self) -> None:
-        with self._top_contact_lock:
-            self._top_contact_sequence = (self._top_contact_sequence % 0xFFFF) + 1
-            sequence = self._top_contact_sequence
-            encoded = sequence | TOP_CONTACT_PING_VALID_MASK
-            if self._top_contact_asserted:
-                encoded |= TOP_CONTACT_PING_CONTACT_MASK
-
-        message = self._mav.ping_encode(
-            int(time.time_ns() // 1000),
-            int(encoded),
-            self.target_system,
-            CUSTOM_COMPONENT,
+    def _top_distance_snapshot(
+        self, now: float
+    ) -> tuple[tuple[float | None, float | None, float | None, float | None], float | None]:
+        with self._lidar_lock:
+            frame = self._top_distance_frame
+        if frame is None:
+            return (None, None, None, None), None
+        distances = tuple(
+            millimetres * 0.001 if frame.valid_mask & (1 << sensor_id) else None
+            for sensor_id, millimetres in enumerate(frame.distances_mm)
         )
-        self._write_custom(message)
-        self._top_contact_tx_count += 1
+        return distances, max(0.0, now - frame.received_at)
+
+    def _lidar_receive_loop(self) -> None:
+        while not self._stop.is_set():
+            lidar_socket = self._lidar_socket
+            if lidar_socket is None:
+                return
+            try:
+                payload, _source = lidar_socket.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                frame = decode_top_distance_packet(payload)
+            except ValueError as exc:
+                self.log(f"[LIDAR] ignored packet: {exc}")
+                continue
+            with self._lidar_lock:
+                previous = self._top_distance_frame
+                if previous is not None and previous.sequence == frame.sequence:
+                    continue
+                self._top_distance_frame = frame
+                self._top_distance_rx_count += 1
+            if not self._top_distance_logged:
+                self._top_distance_logged = True
+                self.log(f"[LIDAR] four-distance stream received on UDP {self.lidar_udp_port}")
+
+    def _send_pending_top_distances(self) -> None:
+        with self._lidar_lock:
+            frame = self._top_distance_frame
+        if frame is None or frame.sequence == self._last_forwarded_top_distance_sequence:
+            return
+        for sensor_id, millimetres in enumerate(frame.distances_mm):
+            encoded = (
+                TOP_DISTANCE_PROTOCOL_MARKER
+                | ((sensor_id & 0x03) << 29)
+                | ((frame.sequence & 0x0FFF) << 16)
+                | (millimetres & 0xFFFF)
+            )
+            if frame.valid_mask & (1 << sensor_id):
+                encoded |= TOP_DISTANCE_VALID_MASK
+            message = self._mav.ping_encode(
+                frame.timestamp_us,
+                encoded,
+                self.target_system,
+                CUSTOM_COMPONENT,
+            )
+            self._write_custom(message)
+        self._last_forwarded_top_distance_sequence = frame.sequence
+        self._top_distance_tx_count += 4
 
     def _send_setpoint(self) -> None:
         if not self._legacy_output_allowed:
@@ -1028,19 +1117,16 @@ class MyLinkMavlinkClient:
     def _transmit_loop(self) -> None:
         next_heartbeat = 0.0
         next_setpoint = 0.0
-        next_top_contact = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
             try:
                 if now >= next_heartbeat:
                     self._send_heartbeat()
                     next_heartbeat = now + 1.0
-                if now >= next_top_contact:
-                    self._send_top_contact_report()
-                    next_top_contact = now + 1.0 / TOP_CONTACT_REPORT_RATE_HZ
                 if self._setpoints_enabled and now >= next_setpoint:
                     self._send_setpoint()
                     next_setpoint = now + 1.0 / self.setpoint_rate_hz
+                self._send_pending_top_distances()
             except OSError as exc:
                 self._record_error(str(exc))
                 return
@@ -1162,14 +1248,12 @@ class MyLinkMavlinkClient:
 
         if result == CUSTOM_RESULT_STARTED:
             self._search_top_active = True
-            with self._top_contact_lock:
-                self._top_contact_asserted = False
             self.log(f"[CUSTOM1] accepted request={ack.project_request_id}; PX4 owns control")
         elif result == CUSTOM_RESULT_BUTTON_CONSUMED:
             self.clear_search_top_active()
         elif result == CUSTOM_RESULT_TOP_HOLD:
             self.clear_search_top_active()
-            self.log("[TOP_HOLD] PX4 reports top contact; holding contact position")
+            self.log("[TOP_HOLD] PX4 confirmed the top-distance threshold; holding position")
         elif result == CUSTOM_RESULT_HANDOVER_PENDING:
             self.clear_search_top_active()
             with self._project_lock:
@@ -1256,8 +1340,9 @@ class EventLog:
 class MyLinkController:
     """Packet wrapper with target safety tied to PX4's observed mode."""
 
-    def __init__(self, log: EventLog) -> None:
+    def __init__(self, log: EventLog, lidar_udp_port: int = TOP_DISTANCE_UDP_PORT) -> None:
         self.log = log
+        self.lidar_udp_port = int(lidar_udp_port)
         self.client: MyLinkMavlinkClient | None = None
         self.origin: tuple[float, float, float] | None = None
         self._last_mode: str | None = None
@@ -1288,6 +1373,7 @@ class MyLinkController:
             raise RuntimeError("MyLink 已连接")
         client = MyLinkMavlinkClient(
             connection_string,
+            lidar_udp_port=self.lidar_udp_port,
             logger=self.log.write,
             trace_logger=getattr(self.log, "write_trace", None),
         )
@@ -1512,15 +1598,6 @@ class MyLinkController:
                 f"[CUSTOM1] rejected project_result={ack.project_result}; legacy control unchanged"
             )
 
-    def simulate_laser_signal(self) -> None:
-        client = self.require_client()
-        if not client.search_top_active():
-            self.log.write("[IGNORED] 模拟激光信号：当前不在寻顶模式")
-            return
-        self.log.write("[INPUT] 模拟激光信号 pressed once")
-        client.simulate_contact()
-        self.log.write("[SENSOR] 开始以20Hz发送 valid=true, contact=true，等待PX4四包确认")
-
     def land(self) -> int:
         self._landing_requested = True
         client = self.require_client()
@@ -1571,11 +1648,10 @@ class OffboardControlGuiV3:
             "connect": "连接", "disconnect": "断开", "language": "语言", "state": "PX4 状态",
             "control": "控制", "events": "事件日志", "address": "MAVLink UDP 地址",
             "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "寻顶模式",
-            "simulate_contact": "模拟激光信号",
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
             "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
-            "battery_row": "电池", "target_row": "最终目标", "command_row": "当前指令",
+            "battery_row": "电池", "top_distance_row": "顶部距离", "target_row": "最终目标", "command_row": "当前指令",
             "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
             "mode": "模式", "armed": "解锁状态", "armed_yes": "已解锁", "armed_no": "未解锁",
             "heartbeat": "心跳", "north": "北", "east": "东", "down_axis": "下", "speed": "速度",
@@ -1585,24 +1661,23 @@ class OffboardControlGuiV3:
             "connect": "CONNECT", "disconnect": "DISCONNECT", "language": "Language", "state": "PX4 STATUS",
             "control": "CONTROL", "events": "EVENT LOG", "address": "MAVLink UDP address",
             "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "SEARCH TOP", "forward": "FORWARD",
-            "simulate_contact": "SIMULATE LASER",
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
             "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
-            "battery_row": "Battery", "target_row": "Final target", "command_row": "Command",
+            "battery_row": "Battery", "top_distance_row": "Top distance", "target_row": "Final target", "command_row": "Command",
             "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
             "mode": "mode", "armed": "armed", "armed_yes": "True", "armed_no": "False",
             "heartbeat": "heartbeat", "north": "N", "east": "E", "down_axis": "D", "speed": "v",
         },
     }
 
-    def __init__(self, root: tk.Tk, connection: str) -> None:
+    def __init__(self, root: tk.Tk, connection: str, lidar_udp_port: int = TOP_DISTANCE_UDP_PORT) -> None:
         self.root = root
         self.language = "zh"
         self.events: queue.Queue[str] = queue.Queue()
         self.event_history: list[str] = []
         self.log = EventLog(self.events.put)
-        self.controller = MyLinkController(self.log)
+        self.controller = MyLinkController(self.log, lidar_udp_port)
         self.connection_var = tk.StringVar(value=connection)
         self.language_var = tk.StringVar(value="中文")
         self.altitude_var = tk.StringVar(value="1.0")
@@ -1611,6 +1686,7 @@ class OffboardControlGuiV3:
         self.position_var = tk.StringVar(value="N —  E —  D —")
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
+        self.top_distance_var = tk.StringVar(value="FR —  FL —  RR —  RL —")
         self.target_var = tk.StringVar(value="N —  E —  D —")
         self.command_var = tk.StringVar(value="N —  E —  D — | v —")
         self._closing = False
@@ -1670,6 +1746,7 @@ class OffboardControlGuiV3:
             (self.tr("position_row"), self.position_var),
             (self.tr("velocity_row"), self.velocity_var),
             (self.tr("battery_row"), self.battery_var),
+            (self.tr("top_distance_row"), self.top_distance_var),
             (self.tr("target_row"), self.target_var),
             (self.tr("command_row"), self.command_var),
         )):
@@ -1692,13 +1769,6 @@ class OffboardControlGuiV3:
             self.action_buttons.append(button)
         ttk.Label(control, text=self.tr("altitude")).grid(row=1, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(control, textvariable=self.altitude_var, width=8).grid(row=1, column=1, sticky="w")
-        self.simulate_contact_button = ttk.Button(
-            control,
-            text=self.tr("simulate_contact"),
-            command=lambda: self.controller.submit("SIMULATE_CONTACT", self.controller.simulate_laser_signal),
-            state="disabled",
-        )
-        self.simulate_contact_button.grid(row=1, column=2, sticky="ew", padx=3, pady=(10, 3))
         ttk.Label(control, text=self.tr("distance")).grid(row=2, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(control, textvariable=self.distance_var, width=8).grid(row=2, column=1, sticky="w")
         directions = (
@@ -1754,6 +1824,11 @@ class OffboardControlGuiV3:
             f"{self.tr('down_axis')} {self._fmt(state.vz)} m/s"
         )
         self.battery_var.set(f"{state.battery_percent if state.battery_percent is not None else '—'}%  {self._fmt(state.battery_voltage_v)}V")
+        labels = ("FR", "FL", "RR", "RL")
+        top_values = "  ".join(
+            f"{label} {self._fmt(value)}" for label, value in zip(labels, state.top_distances_m)
+        )
+        self.top_distance_var.set(f"{top_values} m | age={self._fmt(state.top_distance_age_s)}s")
         target = self.controller.target
         axes = (self.tr("north"), self.tr("east"), self.tr("down_axis"))
         self.target_var.set(
@@ -1776,9 +1851,6 @@ class OffboardControlGuiV3:
         self.disconnect_button.configure(state="normal" if connected and not busy else "disabled")
         for button in self.action_buttons:
             button.configure(state="normal" if connected and not busy else "disabled")
-        self.simulate_contact_button.configure(
-            state="normal" if connected and not busy and self.controller.search_top_active() else "disabled"
-        )
         self.root.after(200, self._refresh)
 
     def _restore_events(self) -> None:
@@ -1826,20 +1898,20 @@ def self_test() -> None:
     ack = CommandAck(MAV_CMD_CUSTOM_ACTION, 0, (123 << 8) | CUSTOM_RESULT_STARTED, 1, 25)
     assert ack.project_request_id == 123
     assert ack.project_result == CUSTOM_RESULT_STARTED
+    packet = TOP_DISTANCE_PACKET.pack(TOP_DISTANCE_MAGIC, TOP_DISTANCE_VERSION, 0x0F, 7, 1234, 10, 20, 30, 40)
+    frame = decode_top_distance_packet(packet, received_at=1.0)
+    assert frame.sequence == 7 and frame.distances_mm == (10, 20, 30, 40)
     client = MyLinkMavlinkClient(DEFAULT_CONNECTION)
     reports = []
     client._write_custom = reports.append
-    client._send_top_contact_report()
-    assert reports[-1].get_type() == "PING"
-    assert reports[-1].target_component == CUSTOM_COMPONENT
-    assert reports[-1].seq == TOP_CONTACT_PING_VALID_MASK | 1
-    client._search_top_active = True
-    client.simulate_contact()
-    client._send_top_contact_report()
-    assert reports[-1].seq == TOP_CONTACT_PING_VALID_MASK | TOP_CONTACT_PING_CONTACT_MASK | 2
-    client.clear_search_top_active()
+    client._top_distance_frame = frame
+    client._send_pending_top_distances()
+    assert len(reports) == 4
+    assert reports[-1].get_type() == "PING" and reports[-1].target_component == CUSTOM_COMPONENT
+    assert reports[0].seq == TOP_DISTANCE_VALID_MASK | TOP_DISTANCE_PROTOCOL_MARKER | (7 << 16) | 10
     controller_names = set(dir(MyLinkController))
-    assert {"takeoff", "descend", "move", "land", "custom", "simulate_laser_signal", "sync_target_to_mode"} <= controller_names
+    assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
+    assert "simulate_laser_signal" not in controller_names
     source = Path(__file__).read_text(encoding="utf-8").split("def self_test()", 1)[0]
     assert "class FlightPhase" not in source
     assert "position_valid" not in source
@@ -1850,7 +1922,7 @@ def self_test() -> None:
     assert "MAV_CMD_DO_SET_MODE" not in source
     assert "DEFAULT_CONNECTION" in source
     assert "CUSTOM_ACTION_REBASE_COMPLETE" in source
-    assert "TOP_CONTACT_REPORT_RATE_HZ = 20.0" in source
+    assert "TOP_DISTANCE_PACKET" in source
     assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
     assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
     print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")
@@ -1859,6 +1931,7 @@ def self_test() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--connection", default=None)
+    parser.add_argument("--lidar-port", type=int, default=TOP_DISTANCE_UDP_PORT)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -1866,7 +1939,7 @@ def main() -> None:
         return
     root = tk.Tk()
     initial_connection = args.connection or load_saved_connection()
-    OffboardControlGuiV3(root, initial_connection)
+    OffboardControlGuiV3(root, initial_connection, args.lidar_port)
     root.mainloop()
 
 

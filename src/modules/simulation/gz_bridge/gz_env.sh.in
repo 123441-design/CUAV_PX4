@@ -20,6 +20,22 @@ export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:$PX4_GZ_MODELS:$PX4_GZ_WORLDS
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$GZ_SIM_SYSTEM_PLUGIN_PATH:$PX4_GZ_PLUGINS
 export GZ_SIM_SERVER_CONFIG_PATH=$PX4_GZ_SERVER_CONFIG
 
+# WSLg may expose /dev/dxg while Mesa still defaults to the CPU-only llvmpipe
+# renderer. Prefer the D3D12 Gallium driver when it is available so camera and
+# single-beam range sensors run on the Windows GPU. Explicit user choices win.
+if [ -e /dev/dxg ] && [ -f /usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so ]; then
+	if [ -z "${GALLIUM_DRIVER:-}" ]; then
+		export GALLIUM_DRIVER=d3d12
+	fi
+
+	if [ "$GALLIUM_DRIVER" = "d3d12" ] && [ -z "${MESA_D3D12_DEFAULT_ADAPTER_NAME:-}" ] \
+	   && command -v nvidia-smi >/dev/null 2>&1; then
+		export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+	fi
+
+	echo "INFO  [init] WSL Gazebo renderer: ${GALLIUM_DRIVER} ${MESA_D3D12_DEFAULT_ADAPTER_NAME:-automatic}"
+fi
+
 # macOS: dyld does not search /opt/homebrew/lib by default. Many
 # gobject-introspection typelibs reference libs by bare basename,
 # which fails to resolve unless we add Homebrew's lib dir to the

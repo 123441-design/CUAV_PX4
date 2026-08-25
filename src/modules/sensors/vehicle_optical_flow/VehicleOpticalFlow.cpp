@@ -147,8 +147,10 @@ void VehicleOpticalFlow::Run()
 
 			// integrate synchronized gyro
 			gyroSample gyro_sample;
+			unsigned gyro_samples_processed = 0;
 
-			while (_gyro_buffer.pop_oldest(timestamp_oldest, timestamp_newest, &gyro_sample)) {
+			while (gyro_samples_processed++ < _gyro_buffer.get_length()
+			       && _gyro_buffer.pop_oldest(timestamp_oldest, timestamp_newest, &gyro_sample)) {
 
 				_gyro_integrator.put(gyro_sample.data, gyro_sample.dt);
 

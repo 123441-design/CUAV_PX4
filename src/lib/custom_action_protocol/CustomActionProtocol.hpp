@@ -10,9 +10,15 @@ namespace custom_action_protocol
 {
 constexpr uint16_t kMavCmdUser1 = 31010;
 constexpr uint8_t kComponentId = 25; // MAV_COMP_ID_USER1
-constexpr uint32_t kTopContactPingContactMask = 1u << 31;
-constexpr uint32_t kTopContactPingValidMask = 1u << 30;
-constexpr uint32_t kTopContactPingSequenceMask = (1u << 30) - 1u;
+// PING.seq carries one measured top distance. Four PING packets with the same
+// 12-bit sequence form one sensor frame. Bit 28 is a protocol-version marker,
+// so an obsolete top-contact boolean packet cannot be mistaken for distance.
+constexpr uint32_t kTopDistancePingValidMask = 1u << 31;
+constexpr uint32_t kTopDistancePingSensorMask = 3u << 29;
+constexpr uint32_t kTopDistancePingVersionMask = 1u << 28;
+constexpr uint32_t kTopDistancePingSequenceMask = 0x0FFFu << 16;
+constexpr uint32_t kTopDistancePingMillimetresMask = 0xFFFFu;
+constexpr uint8_t kTopDistanceSensorCount = 4;
 
 enum class Command : uint8_t {
 	SearchTop = 1,
