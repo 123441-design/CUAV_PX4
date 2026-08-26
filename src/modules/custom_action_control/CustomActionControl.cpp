@@ -4,6 +4,7 @@
 
 #include "CustomActionControl.hpp"
 
+#include <geo/geo.h>
 #include <lib/custom_action_protocol/CustomActionProtocol.hpp>
 #include <mathlib/mathlib.h>
 #include <px4_platform_common/cli.h>
@@ -22,8 +23,6 @@ namespace
 constexpr hrt_abstime kRunInterval = 20_ms;
 constexpr hrt_abstime kLocalPositionTimeout = 500_ms;
 constexpr hrt_abstime kStatusInterval = 500_ms;
-constexpr uint8_t kRequiredContactSamples = 4;
-
 const char *reasonName(uint8_t reason)
 {
 	switch (reason) {
@@ -98,7 +97,7 @@ bool CustomActionControl::sensorFresh(hrt_abstime now) const
 	return true;
 }
 
-bool CustomActionControl::topDistanceTriggered() const
+float CustomActionControl::minimumTopDistance() const
 {
 	float minimum_distance = INFINITY;
 
@@ -106,7 +105,43 @@ bool CustomActionControl::topDistanceTriggered() const
 		minimum_distance = math::min(minimum_distance, distance);
 	}
 
-	return PX4_ISFINITE(minimum_distance) && minimum_distance <= _param_top_gap.get();
+	return minimum_distance;
+}
+
+void CustomActionControl::updateFilteredTopDistance()
+{
+	const float measured_distance = minimumTopDistance();
+
+	if (!PX4_ISFINITE(measured_distance)) {
+		return;
+	}
+
+	if (!PX4_ISFINITE(_filtered_top_distance)) {
+		_filtered_top_distance = measured_distance;
+
+	} else {
+		_filtered_top_distance += _param_top_filter.get() * (measured_distance - _filtered_top_distance);
+	}
+}
+
+bool CustomActionControl::isPrecontactState() const
+{
+	return _state == custom_action_status_s::STATE_SEARCH_TOP
+	       || _state == custom_action_status_s::STATE_TOP_APPROACH
+	       || _state == custom_action_status_s::STATE_CONTACT_VERIFY;
+}
+
+float CustomActionControl::activeClimbVelocity() const
+{
+	if (_state == custom_action_status_s::STATE_TOP_APPROACH) {
+		return _param_approach_velocity.get();
+	}
+
+	if (_state == custom_action_status_s::STATE_CONTACT_VERIFY) {
+		return _param_verify_velocity.get();
+	}
+
+	return _param_top_velocity.get();
 }
 
 bool CustomActionControl::captureHoldPoint()
@@ -148,7 +183,7 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	const hrt_abstime now = hrt_absolute_time();
 
 	if (_owner != custom_action_status_s::OWNER_LEGACY || _state != custom_action_status_s::STATE_INACTIVE
-	    || !flightStateAllowsCustom() || !sensorFresh(now) || topDistanceTriggered() || !captureHoldPoint()) {
+	    || !flightStateAllowsCustom() || !sensorFresh(now) || !captureHoldPoint()) {
 		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
 			   static_cast<uint8_t>(Result::None));
 		return;
@@ -165,7 +200,11 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	_heading_reset_counter = _local_position.heading_reset_counter;
 	_search_started = now;
 	_last_top_distance_sequence = _top_distance.sequence;
-	_contact_confirm_count = 0;
+	_filtered_top_distance = minimumTopDistance();
+	_verify_min_distance = NAN;
+	_verify_max_distance = NAN;
+	_verify_started = 0;
+	_press_started = 0;
 	_handover_started = 0;
 	PX4_INFO("[SEARCH_TOP] entered xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z, (double)_locked_yaw);
@@ -187,7 +226,8 @@ void CustomActionControl::beginHandover(uint8_t reason, uint16_t handover_id,
 	_reason = reason;
 	_handover_id = handover_id == 0 ? 1 : handover_id;
 	_handover_started = hrt_absolute_time();
-	_contact_confirm_count = 0;
+	_verify_started = 0;
+	_press_started = 0;
 	PX4_WARN("[CUSTOM] handover id=%u reason=%s(%u) hold=(%.2f, %.2f, %.2f)",
 		 _handover_id, reasonName(reason), reason,
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z);
@@ -283,23 +323,44 @@ void CustomActionControl::handleCommand(const vehicle_command_s &command)
 	}
 }
 
-void CustomActionControl::enterTopHold()
+void CustomActionControl::enterTopApproach()
+{
+	_state = custom_action_status_s::STATE_TOP_APPROACH;
+	_owner = custom_action_status_s::OWNER_CUSTOM;
+	_verify_started = 0;
+	_verify_min_distance = NAN;
+	_verify_max_distance = NAN;
+	PX4_INFO("[TOP_FOUND] distance=%.3f m; slow approach", (double)_filtered_top_distance);
+	publishStatus(true);
+}
+
+void CustomActionControl::enterContactVerify(hrt_abstime now)
+{
+	_state = custom_action_status_s::STATE_CONTACT_VERIFY;
+	_verify_started = now;
+	_verify_min_distance = _filtered_top_distance;
+	_verify_max_distance = _filtered_top_distance;
+	PX4_INFO("[CONTACT_VERIFY] distance=%.3f m", (double)_filtered_top_distance);
+	publishStatus(true);
+}
+
+void CustomActionControl::enterContactPress(hrt_abstime now)
 {
 	if (!captureHoldPoint()) {
 		beginHandover(custom_action_status_s::REASON_ESTIMATOR, _active_request_id,
-			      _active_source_system, _active_source_component, true);
+				      _active_source_system, _active_source_component, true);
 		return;
 	}
 
-	_state = custom_action_status_s::STATE_TOP_HOLD;
+	_state = custom_action_status_s::STATE_CONTACT_PRESS;
 	_owner = custom_action_status_s::OWNER_CUSTOM;
 	_reason = custom_action_status_s::REASON_TOP_DISTANCE;
-	_contact_confirm_count = 0;
-	PX4_INFO("[SEARCH_TOP] top distance threshold reached");
-	PX4_INFO("[TOP_HOLD] entered z=%.2f", (double)_hold_z);
+	_verify_started = 0;
+	_press_started = now;
+	PX4_INFO("[CONTACT_PRESS] stable contact at z=%.2f; pressure ramp active", (double)_hold_z);
 	publishStatus(true);
 	publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
-			static_cast<uint8_t>(Result::TopHoldEntered), _active_request_id,
+			static_cast<uint8_t>(Result::ContactPressEntered), _active_request_id,
 			_active_source_system, _active_source_component);
 }
 
@@ -311,7 +372,9 @@ void CustomActionControl::releaseToLegacy(uint8_t reason)
 	_handover_id = 0;
 	_search_started = 0;
 	_handover_started = 0;
-	_contact_confirm_count = 0;
+	_verify_started = 0;
+	_press_started = 0;
+	_filtered_top_distance = NAN;
 	publishStatus(true);
 }
 
@@ -323,31 +386,46 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 	_handover_id = 0;
 	_search_started = 0;
 	_handover_started = 0;
-	_contact_confirm_count = 0;
+	_verify_started = 0;
+	_press_started = 0;
+	_filtered_top_distance = NAN;
 	PX4_INFO("[CUSTOM] control released to Commander: %s", reasonName(reason));
 	publishStatus(true);
 }
 
 void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 {
+	const bool precontact = isPrecontactState();
+	const bool contact_press = _state == custom_action_status_s::STATE_CONTACT_PRESS;
 	offboard_control_mode_s control_mode{};
 	control_mode.timestamp = now;
 	control_mode.position = true;
-	control_mode.velocity = _state == custom_action_status_s::STATE_SEARCH_TOP;
+	control_mode.velocity = precontact;
+	control_mode.acceleration = contact_press;
 	_offboard_control_mode_pub.publish(control_mode);
 
 	trajectory_setpoint_s setpoint{};
 	setpoint.timestamp = now;
 	setpoint.position[0] = _hold_x;
 	setpoint.position[1] = _hold_y;
-	setpoint.position[2] = _state == custom_action_status_s::STATE_SEARCH_TOP ? NAN : _hold_z;
+	setpoint.position[2] = (precontact || contact_press) ? NAN : _hold_z;
 	setpoint.velocity[0] = NAN;
 	setpoint.velocity[1] = NAN;
-	setpoint.velocity[2] = _state == custom_action_status_s::STATE_SEARCH_TOP ? -_param_top_velocity.get() : NAN;
+	setpoint.velocity[2] = precontact ? -activeClimbVelocity() : NAN;
 
 	for (int i = 0; i < 3; ++i) {
 		setpoint.acceleration[i] = NAN;
 		setpoint.jerk[i] = NAN;
+	}
+
+	if (contact_press) {
+		const float elapsed = static_cast<float>(now - _press_started) * 1e-6f;
+		const float thrust_offset = math::min(_param_press_add.get(), _param_press_ramp.get() * elapsed);
+		const float hover_thrust = math::max(_param_hover_thrust.get(), 0.05f);
+		// Mixed-axis PositionControl input: x/y remain position-controlled while z
+		// is a finite acceleration feed-forward. This retains attitude control and
+		// avoids an unreachable vertical position error and integrator wind-up.
+		setpoint.acceleration[2] = -CONSTANTS_ONE_G * thrust_offset / hover_thrust;
 	}
 
 	setpoint.yaw = _locked_yaw;
@@ -413,7 +491,15 @@ void CustomActionControl::Run()
 		releaseToLegacy(custom_action_status_s::REASON_NONE);
 	}
 
-	if (_state == custom_action_status_s::STATE_SEARCH_TOP) {
+	bool new_distance_frame = false;
+
+	if (top_distance_updated && _top_distance.sequence != _last_top_distance_sequence) {
+		_last_top_distance_sequence = _top_distance.sequence;
+		updateFilteredTopDistance();
+		new_distance_frame = true;
+	}
+
+	if (isPrecontactState()) {
 		if (!localStateValid()) {
 			beginHandover(custom_action_status_s::REASON_ESTIMATOR, _active_request_id,
 				      _active_source_system, _active_source_component, true);
@@ -434,19 +520,35 @@ void CustomActionControl::Run()
 			beginHandover(custom_action_status_s::REASON_TIMEOUT, _active_request_id,
 				      _active_source_system, _active_source_component, true);
 
-		} else if (top_distance_updated) {
-			// Contact is decided inside PX4 from raw measured distance. Four
-			// consecutive complete frames below the gap threshold are required.
-			if (_top_distance.sequence == _last_top_distance_sequence
-			    || !topDistanceTriggered()) {
-				_contact_confirm_count = 0;
+		} else if (new_distance_frame && _state == custom_action_status_s::STATE_SEARCH_TOP
+			   && _filtered_top_distance <= _param_top_gap.get()) {
+			enterTopApproach();
+
+		} else if (new_distance_frame && _state == custom_action_status_s::STATE_TOP_APPROACH) {
+			if (_filtered_top_distance > _param_top_gap.get() + _param_top_hysteresis.get()) {
+				_state = custom_action_status_s::STATE_SEARCH_TOP;
+				PX4_INFO("[TOP_APPROACH] top lost; resume search");
+				publishStatus(true);
+
+			} else if (_filtered_top_distance <= _param_contact_distance.get()) {
+				enterContactVerify(now);
+			}
+
+		} else if (new_distance_frame && _state == custom_action_status_s::STATE_CONTACT_VERIFY) {
+			if (_filtered_top_distance > _param_contact_distance.get() + _param_top_hysteresis.get()) {
+				enterTopApproach();
 
 			} else {
-				_last_top_distance_sequence = _top_distance.sequence;
-				_contact_confirm_count++;
+				_verify_min_distance = math::min(_verify_min_distance, _filtered_top_distance);
+				_verify_max_distance = math::max(_verify_max_distance, _filtered_top_distance);
 
-				if (_contact_confirm_count >= kRequiredContactSamples) {
-					enterTopHold();
+				if (_verify_max_distance - _verify_min_distance > _param_stability_band.get()) {
+					_verify_started = now;
+					_verify_min_distance = _filtered_top_distance;
+					_verify_max_distance = _filtered_top_distance;
+
+				} else if (now - _verify_started >= static_cast<hrt_abstime>(_param_contact_time.get() * 1_s)) {
+					enterContactPress(now);
 				}
 			}
 

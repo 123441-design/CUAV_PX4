@@ -146,10 +146,13 @@
         </surface>
       </collision>
 
-      <!-- Four fixed upward lidars at the wheel locations. The ray axis is +Z. -->
+      <!-- Four fixed upward single-beam distance sensors at the wheel locations.
+           Their origins sit 30 mm below the wheel tops so a wheel-to-ceiling
+           contact still produces a measurable distance instead of an invalid
+           zero-range sample. The ray axis is +Z. -->
       <sensor name="cart_lidar_fr" type="gpu_lidar">
         <gz_frame_id>cart_lidar_fr</gz_frame_id>
-        <pose>0.09 0.055 0.080 0 -1.5707963 0</pose>
+        <pose>0.09 0.055 0.045 0 -1.5707963 0</pose>
         <update_rate>20</update_rate>
         <ray>
           <scan>
@@ -164,7 +167,7 @@
       </sensor>
       <sensor name="cart_lidar_fl" type="gpu_lidar">
         <gz_frame_id>cart_lidar_fl</gz_frame_id>
-        <pose>0.09 -0.055 0.080 0 -1.5707963 0</pose>
+        <pose>0.09 -0.055 0.045 0 -1.5707963 0</pose>
         <update_rate>20</update_rate>
         <ray>
           <scan>
@@ -179,7 +182,7 @@
       </sensor>
       <sensor name="cart_lidar_rr" type="gpu_lidar">
         <gz_frame_id>cart_lidar_rr</gz_frame_id>
-        <pose>-0.09 0.055 0.080 0 -1.5707963 0</pose>
+        <pose>-0.09 0.055 0.045 0 -1.5707963 0</pose>
         <update_rate>20</update_rate>
         <ray>
           <scan>
@@ -194,7 +197,7 @@
       </sensor>
       <sensor name="cart_lidar_rl" type="gpu_lidar">
         <gz_frame_id>cart_lidar_rl</gz_frame_id>
-        <pose>-0.09 -0.055 0.080 0 -1.5707963 0</pose>
+        <pose>-0.09 -0.055 0.045 0 -1.5707963 0</pose>
         <update_rate>20</update_rate>
         <ray>
           <scan>

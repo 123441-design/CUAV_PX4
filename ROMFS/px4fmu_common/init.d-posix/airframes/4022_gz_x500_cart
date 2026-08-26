@@ -13,6 +13,13 @@ PX4_SIM_MODEL=${PX4_SIM_MODEL:=x500_cart}
 
 param set-default SIM_GZ_EN 1
 
+# Gazebo's ideal accelerometer must not reuse a saved SITL calibration. A
+# non-zero offset is integrated across the initial Gazebo clock handover and
+# can corrupt the EKF attitude before arming.
+param set CAL_ACC0_XOFF 0.0
+param set CAL_ACC0_YOFF 0.0
+param set CAL_ACC0_ZOFF 0.0
+
 # Holybro H-Flow equivalent: Gazebo optical-flow camera + downward ToF range.
 param set-default SIM_GZ_EN_FLOW 1
 param set-default SIM_GZ_EN_LIDAR 1

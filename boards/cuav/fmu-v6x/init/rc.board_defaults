@@ -14,10 +14,15 @@ param set-default MAV_2_UDP_PRT 14550
 
 param set-default USB_MAV_MODE 5
 
-# Dedicated MyLink MAVLink decoder on TELEM2. USB MAVLink remains available
-# for QGC, arming, mode selection and manual takeover.
+# Keep the two physical UART links independent:
+# - MyLink/WiFi control stays on TELEM2.
+# - The fused four-laser MAVLink receiver owns TELEM1.
+# MAV_0 normally owns TELEM1, so disable that telemetry instance. USB MAVLink
+# remains available for QGC, arming, mode selection and manual takeover.
 param set-default MAV_0_CONFIG 0
 param set-default MLB_CONFIG 102
+param set-default TDB_CONFIG 101
+param set-default SER_TEL1_BAUD 115200
 param set-default SER_TEL2_BAUD 115200
 
 safety_button start

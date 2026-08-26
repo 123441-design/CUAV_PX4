@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include <px4_platform_common/module.h>
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
@@ -41,7 +43,9 @@ private:
 	void startSearchTop(const vehicle_command_s &command, uint16_t request_id);
 	void handleDirectionIntent(const vehicle_command_s &command, uint16_t request_id);
 	void handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id);
-	void enterTopHold();
+	void enterTopApproach();
+	void enterContactVerify(hrt_abstime now);
+	void enterContactPress(hrt_abstime now);
 	void beginHandover(uint8_t reason, uint16_t handover_id, uint8_t target_system,
 			   uint16_t target_component, bool notify_pending);
 	void releaseToLegacy(uint8_t reason);
@@ -50,7 +54,10 @@ private:
 	bool flightStateAllowsCustom() const;
 	bool localStateValid() const;
 	bool sensorFresh(hrt_abstime now) const;
-	bool topDistanceTriggered() const;
+	float minimumTopDistance() const;
+	void updateFilteredTopDistance();
+	bool isPrecontactState() const;
+	float activeClimbVelocity() const;
 	void publishControlSetpoint(hrt_abstime now);
 	void publishStatus(bool force = false);
 	void publishAck(const vehicle_command_s &command, uint8_t result, uint8_t project_result);
@@ -84,10 +91,14 @@ private:
 	float _hold_z{0.f};
 	float _locked_yaw{0.f};
 	float _start_z{0.f};
+	float _filtered_top_distance{NAN};
+	float _verify_min_distance{NAN};
+	float _verify_max_distance{NAN};
 	uint8_t _heading_reset_counter{0};
 	hrt_abstime _search_started{0};
 	uint16_t _last_top_distance_sequence{0};
-	uint8_t _contact_confirm_count{0};
+	hrt_abstime _verify_started{0};
+	hrt_abstime _press_started{0};
 	hrt_abstime _handover_started{0};
 	hrt_abstime _last_status_publish{0};
 
@@ -97,7 +108,17 @@ private:
 		(ParamFloat<px4::params::CUST_TOP_DIST>) _param_top_distance,
 		(ParamFloat<px4::params::CUST_TOP_TIME>) _param_top_time,
 		(ParamFloat<px4::params::CUST_TOP_GAP>) _param_top_gap,
+		(ParamFloat<px4::params::CUST_TOP_FILT>) _param_top_filter,
+		(ParamFloat<px4::params::CUST_TOP_HYST>) _param_top_hysteresis,
+		(ParamFloat<px4::params::CUST_APP_VEL>) _param_approach_velocity,
+		(ParamFloat<px4::params::CUST_VER_VEL>) _param_verify_velocity,
+		(ParamFloat<px4::params::CUST_CNT_DIST>) _param_contact_distance,
+		(ParamFloat<px4::params::CUST_CNT_TIME>) _param_contact_time,
+		(ParamFloat<px4::params::CUST_STAB_BND>) _param_stability_band,
+		(ParamFloat<px4::params::CUST_PRS_ADD>) _param_press_add,
+		(ParamFloat<px4::params::CUST_PRS_RAMP>) _param_press_ramp,
 		(ParamFloat<px4::params::CUST_SENS_TO>) _param_sensor_timeout,
-		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout
+		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout,
+		(ParamFloat<px4::params::MPC_THR_HOVER>) _param_hover_thrust
 	)
 };

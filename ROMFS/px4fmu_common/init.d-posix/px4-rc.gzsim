@@ -45,13 +45,34 @@ if [ -z "${PX4_GZ_STANDALONE}" ]; then
 			. ../gz_env.sh
 		fi
 
+		# x500_cart needs optical flow and range sensors, but no encoded video
+		# stream. Avoid the WSL NVCodec crash without affecting other models.
+		if { [ "${PX4_SIM_MODEL}" = "x500_cart" ] || [ "${PX4_SIM_MODEL}" = "gz_x500_cart" ]; } \
+		   && [ -f "${PX4_GZ_SERVER_CONFIG_X500_CART}" ]; then
+			export GZ_SIM_SERVER_CONFIG_PATH="${PX4_GZ_SERVER_CONFIG_X500_CART}"
+			echo "INFO  [init] Using x500_cart Gazebo server configuration"
+		fi
+
 		echo "INFO  [init] Starting gazebo with world: ${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf"
 
 		${gz_command} ${gz_sub_command} --verbose=${GZ_VERBOSE:=1} -r -s "${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf" &
+		gz_server_pid=$!
+		gz_gui_pid=""
 
 		if [ -z "${HEADLESS}" ]; then
 			echo "INFO  [init] Starting gz gui"
 			${gz_command} ${gz_sub_command} -g > /dev/null 2>&1 &
+			gz_gui_pid=$!
+		fi
+
+		# The CMake launcher owns this file and uses it to clean up only the
+		# Gazebo processes started by the current PX4 simulation session.
+		if [ -n "${PX4_GZ_PID_FILE}" ]; then
+			printf '%s\n' "${gz_server_pid}" > "${PX4_GZ_PID_FILE}"
+
+			if [ -n "${gz_gui_pid}" ]; then
+				printf '%s\n' "${gz_gui_pid}" >> "${PX4_GZ_PID_FILE}"
+			fi
 		fi
 
 	else
@@ -186,29 +207,27 @@ if [ -n "${PX4_SIM_MODEL#*gz_}" ] && [ -z "${PX4_GZ_MODEL_NAME}" ]; then
 					--req "real_time_factor: ${PX4_SIM_SPEED_FACTOR}, max_step_size: ${MAX_STEP_SIZE}, gravity: {x: ${GZ_GRAVITY_X}, y: ${GZ_GRAVITY_Y}, z: ${GZ_GRAVITY_Z}}" > /dev/null 2>&1
 	fi
 
-	# Set up camera to follow the model if requested
+	# Set up the GUI camera if requested.
 	if [ -z "${PX4_GZ_NO_FOLLOW}" ]; then
 
-		echo "INFO  [init] Setting camera to follow ${MODEL_NAME_INSTANCE}"
-
-		# Keep the x500_cart camera below the canopy slab when it reaches the roof.
-		# This gives a side-rear view at approximately the same height as the vehicle.
+		# v7_four_post_canopy defines a fixed observer below the roof. Do not replace it
+		# with model tracking, otherwise the camera can cross the roof during top contact.
 		if [ "${PX4_SIM_MODEL}" = "x500_cart" ] || [ "${PX4_SIM_MODEL}" = "gz_x500_cart" ]; then
-			follow_x=${PX4_GZ_FOLLOW_OFFSET_X:--3.0}
-			follow_y=${PX4_GZ_FOLLOW_OFFSET_Y:--3.0}
-			follow_z=${PX4_GZ_FOLLOW_OFFSET_Z:-0.0}
+			echo "INFO  [init] Using fixed canopy camera from ${PX4_GZ_WORLD}.sdf"
 		else
+			echo "INFO  [init] Setting camera to follow ${MODEL_NAME_INSTANCE}"
+
 			follow_x=${PX4_GZ_FOLLOW_OFFSET_X:--2.0}
 			follow_y=${PX4_GZ_FOLLOW_OFFSET_Y:--2.0}
 			follow_z=${PX4_GZ_FOLLOW_OFFSET_Z:-2.0}
+
+			# Set camera offset
+			${gz_command} topic -t /gui/track -m gz.msgs.CameraTrack \
+					-p "track_mode: FOLLOW, follow_target: {name: '${MODEL_NAME_INSTANCE}'},\
+					 follow_offset: {x: ${follow_x}, y: ${follow_y}, z: ${follow_z}}, follow_pgain: 1.0, track_pgain: 1.0"
+
+			echo "INFO  [init] Camera follow offset set to ${follow_x}, ${follow_y}, ${follow_z}"
 		fi
-
-		# Set camera offset
-		${gz_command} topic -t /gui/track -m gz.msgs.CameraTrack \
-				-p "track_mode: FOLLOW, follow_target: {name: '${MODEL_NAME_INSTANCE}'},\
-				 follow_offset: {x: ${follow_x}, y: ${follow_y}, z: ${follow_z}}, follow_pgain: 1.0, track_pgain: 1.0"
-
-		echo "INFO  [init] Camera follow offset set to ${follow_x}, ${follow_y}, ${follow_z}"
 	fi
 
 elif [ -n "${PX4_GZ_MODEL_NAME}" ]; then

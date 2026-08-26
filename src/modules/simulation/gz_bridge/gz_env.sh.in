@@ -19,6 +19,7 @@ export PX4_GZ_SERVER_CONFIG=@PX4_SOURCE_DIR@/src/modules/simulation/gz_bridge/se
 export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:$PX4_GZ_MODELS:$PX4_GZ_WORLDS
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$GZ_SIM_SYSTEM_PLUGIN_PATH:$PX4_GZ_PLUGINS
 export GZ_SIM_SERVER_CONFIG_PATH=$PX4_GZ_SERVER_CONFIG
+export PX4_GZ_SERVER_CONFIG_X500_CART=@PX4_SOURCE_DIR@/src/modules/simulation/gz_bridge/server_x500_cart.config
 
 # WSLg may expose /dev/dxg while Mesa still defaults to the CPU-only llvmpipe
 # renderer. Prefer the D3D12 Gallium driver when it is available so camera and

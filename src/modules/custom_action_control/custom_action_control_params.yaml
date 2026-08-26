@@ -37,13 +37,96 @@ parameters:
         decimal: 1
       CUST_TOP_GAP:
         description:
-          short: Top-distance threshold
-          long: The minimum of the four measured upward distances must remain below this threshold for four complete frames before entering TOP_HOLD.
+          short: Top found distance
+          long: Filtered minimum upward distance that changes SEARCH_TOP into the slow TOP_APPROACH stage.
+        type: float
+        unit: m
+        min: 0.05
+        max: 0.50
+        default: 0.10
+        decimal: 3
+      CUST_TOP_FILT:
+        description:
+          short: Top-distance filter factor
+          long: Low-pass filter factor applied to the minimum of the four upward distances. A smaller value gives stronger smoothing.
+        type: float
+        min: 0.01
+        max: 1.00
+        default: 0.25
+        decimal: 2
+      CUST_TOP_HYST:
+        description:
+          short: Top-distance state hysteresis
+          long: Extra distance required to leave TOP_APPROACH or CONTACT_VERIFY after entering it.
+        type: float
+        unit: m
+        min: 0.00
+        max: 0.10
+        default: 0.02
+        decimal: 3
+      CUST_APP_VEL:
+        description:
+          short: TOP_APPROACH upward speed
+        type: float
+        unit: m/s
+        min: 0.01
+        max: 0.15
+        default: 0.05
+        decimal: 2
+      CUST_VER_VEL:
+        description:
+          short: CONTACT_VERIFY upward speed
+        type: float
+        unit: m/s
+        min: 0.005
+        max: 0.05
+        default: 0.02
+        decimal: 3
+      CUST_CNT_DIST:
+        description:
+          short: Contact verification entry distance
         type: float
         unit: m
         min: 0.01
-        max: 0.50
-        default: 0.08
+        max: 0.10
+        default: 0.04
+        decimal: 3
+      CUST_CNT_TIME:
+        description:
+          short: Stable contact confirmation time
+        type: float
+        unit: s
+        min: 0.10
+        max: 2.00
+        default: 0.50
+        decimal: 2
+      CUST_STAB_BND:
+        description:
+          short: Contact distance stability band
+          long: During CONTACT_VERIFY the filtered minimum distance must remain inside this total range for the confirmation time.
+        type: float
+        unit: m
+        min: 0.001
+        max: 0.030
+        default: 0.005
+        decimal: 3
+      CUST_PRS_ADD:
+        description:
+          short: Contact thrust offset
+          long: Normalized thrust added above hover after stable contact. Attitude and horizontal position control remain active.
+        type: float
+        min: 0.00
+        max: 0.15
+        default: 0.05
+        decimal: 3
+      CUST_PRS_RAMP:
+        description:
+          short: Contact thrust ramp rate
+        type: float
+        unit: 1/s
+        min: 0.005
+        max: 0.20
+        default: 0.05
         decimal: 3
       CUST_SENS_TO:
         description:

@@ -271,11 +271,6 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	mavlink_msg_ping_decode(&message, &ping);
 	_handled_messages++;
 
-	if (ping.target_component == custom_action_protocol::kComponentId) {
-		handleTopDistancePing(message, ping);
-		return;
-	}
-
 	// target 0/0 is the standard MAVLink ping request. A targeted PING is a
 	// response and must not be echoed again.
 	if (ping.target_system != 0 || ping.target_component != 0) {
@@ -291,78 +286,6 @@ void MylinkBridge::handlePing(const mavlink_message_t &message)
 	mavlink_msg_ping_pack_status(system_id, component_id, &_tx_status, &response,
 				     ping.time_usec, ping.seq, message.sysid, message.compid);
 	sendMavlinkMessage(response);
-}
-
-void MylinkBridge::handleTopDistancePing(const mavlink_message_t &message,
-		const mavlink_ping_t &ping)
-{
-	vehicle_status_s status{};
-	_vehicle_status_sub.copy(&status);
-	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
-
-	if (ping.target_system != 0 && ping.target_system != system_id) {
-		return;
-	}
-
-	const uint32_t encoded = ping.seq;
-
-	if ((encoded & custom_action_protocol::kTopDistancePingVersionMask) == 0) {
-		_invalid_top_distance_reports++;
-		return;
-	}
-
-	const uint8_t sensor_id = static_cast<uint8_t>(
-		(encoded & custom_action_protocol::kTopDistancePingSensorMask) >> 29);
-	const uint16_t sequence = static_cast<uint16_t>(
-		(encoded & custom_action_protocol::kTopDistancePingSequenceMask) >> 16);
-	const uint16_t distance_mm = static_cast<uint16_t>(
-		encoded & custom_action_protocol::kTopDistancePingMillimetresMask);
-	const bool valid = (encoded & custom_action_protocol::kTopDistancePingValidMask) != 0
-			   && distance_mm > 0;
-
-	if (sensor_id >= custom_action_protocol::kTopDistanceSensorCount) {
-		_invalid_top_distance_reports++;
-		return;
-	}
-
-	if (!_pending_top_distance_valid || sequence != _pending_top_distance_sequence
-	    || message.sysid != _pending_top_distance_system
-	    || message.compid != _pending_top_distance_component) {
-		_pending_top_distance = {};
-		_pending_top_distance_sequence = sequence;
-		_pending_top_distance_system = message.sysid;
-		_pending_top_distance_component = message.compid;
-		_pending_top_distance_received_mask = 0;
-		_pending_top_distance_valid = true;
-	}
-
-	const uint8_t sensor_bit = 1u << sensor_id;
-
-	if ((_pending_top_distance_received_mask & sensor_bit) != 0) {
-		_duplicate_top_distance_reports++;
-		return;
-	}
-
-	const hrt_abstime now = hrt_absolute_time();
-	_pending_top_distance.timestamp_sample[sensor_id] = now;
-	_pending_top_distance.distance_m[sensor_id] = valid ? distance_mm * 0.001f : NAN;
-
-	if (valid) {
-		_pending_top_distance.valid_mask |= sensor_bit;
-	}
-
-	_pending_top_distance_received_mask |= sensor_bit;
-
-	if (_pending_top_distance_received_mask == (1u << custom_action_protocol::kTopDistanceSensorCount) - 1u) {
-		_pending_top_distance.timestamp = now;
-		_pending_top_distance.sequence = sequence;
-		_top_distance_pub.publish(_pending_top_distance);
-		_top_distance_reports++;
-
-		if (_pending_top_distance.valid_mask != _pending_top_distance_received_mask) {
-			_invalid_top_distance_reports++;
-		}
-	}
 }
 
 void MylinkBridge::handleHeartbeat(const mavlink_message_t &message)
@@ -742,9 +665,6 @@ void MylinkBridge::clearSessionState()
 	_event_flags = EventNone;
 	_latest_event_command = 0;
 	_commander_owns_control = false;
-	_pending_top_distance = {};
-	_pending_top_distance_received_mask = 0;
-	_pending_top_distance_valid = false;
 	_session_resets++;
 }
 
@@ -1162,8 +1082,6 @@ int MylinkBridge::print_status()
 		 " ack_relayed=%" PRIu32,
 		 _custom_action_commands, _custom_action_status.control_owner, _custom_action_status.state,
 		 _custom_action_status.handover_id, _legacy_setpoints_blocked, _relayed_command_acks);
-	PX4_INFO("top_distance: frames=%" PRIu32 " invalid=%" PRIu32 " duplicate=%" PRIu32,
-		 _top_distance_reports, _invalid_top_distance_reports, _duplicate_top_distance_reports);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,

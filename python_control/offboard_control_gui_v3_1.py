@@ -45,14 +45,12 @@ CUSTOM_RESULT_BUTTON_CONSUMED = 2
 CUSTOM_RESULT_LEGACY_ALLOWED = 3
 CUSTOM_RESULT_REBASE_ACCEPTED = 4
 CUSTOM_RESULT_HANDOVER_PENDING = 5
-CUSTOM_RESULT_TOP_HOLD = 6
+CUSTOM_RESULT_CONTACT_PRESS = 6
 SETPOINT_RATE_HZ = 10.0
 TOP_DISTANCE_UDP_PORT = 14600
 TOP_DISTANCE_MAGIC = b"V3LD"
 TOP_DISTANCE_VERSION = 1
 TOP_DISTANCE_PACKET = struct.Struct("!4sBBHQ4H")
-TOP_DISTANCE_PROTOCOL_MARKER = 1 << 28
-TOP_DISTANCE_VALID_MASK = 1 << 31
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
 Z_MAX_SPEED_UP_M_S = 0.30
@@ -626,9 +624,7 @@ class MyLinkMavlinkClient:
         self._lidar_socket: socket.socket | None = None
         self._lidar_lock = threading.Lock()
         self._top_distance_frame: TopDistanceFrame | None = None
-        self._last_forwarded_top_distance_sequence: int | None = None
         self._top_distance_rx_count = 0
-        self._top_distance_tx_count = 0
         self._top_distance_logged = False
 
     def start(self, timeout_s: float = 12.0) -> None:
@@ -661,7 +657,6 @@ class MyLinkMavlinkClient:
         self._search_top_active = False
         with self._lidar_lock:
             self._top_distance_frame = None
-            self._last_forwarded_top_distance_sequence = None
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
@@ -994,30 +989,6 @@ class MyLinkMavlinkClient:
                 self._top_distance_logged = True
                 self.log(f"[LIDAR] four-distance stream received on UDP {self.lidar_udp_port}")
 
-    def _send_pending_top_distances(self) -> None:
-        with self._lidar_lock:
-            frame = self._top_distance_frame
-        if frame is None or frame.sequence == self._last_forwarded_top_distance_sequence:
-            return
-        for sensor_id, millimetres in enumerate(frame.distances_mm):
-            encoded = (
-                TOP_DISTANCE_PROTOCOL_MARKER
-                | ((sensor_id & 0x03) << 29)
-                | ((frame.sequence & 0x0FFF) << 16)
-                | (millimetres & 0xFFFF)
-            )
-            if frame.valid_mask & (1 << sensor_id):
-                encoded |= TOP_DISTANCE_VALID_MASK
-            message = self._mav.ping_encode(
-                frame.timestamp_us,
-                encoded,
-                self.target_system,
-                CUSTOM_COMPONENT,
-            )
-            self._write_custom(message)
-        self._last_forwarded_top_distance_sequence = frame.sequence
-        self._top_distance_tx_count += 4
-
     def _send_setpoint(self) -> None:
         if not self._legacy_output_allowed:
             return
@@ -1126,7 +1097,6 @@ class MyLinkMavlinkClient:
                 if self._setpoints_enabled and now >= next_setpoint:
                     self._send_setpoint()
                     next_setpoint = now + 1.0 / self.setpoint_rate_hz
-                self._send_pending_top_distances()
             except OSError as exc:
                 self._record_error(str(exc))
                 return
@@ -1242,7 +1212,7 @@ class MyLinkMavlinkClient:
             CUSTOM_RESULT_STARTED,
             CUSTOM_RESULT_BUTTON_CONSUMED,
             CUSTOM_RESULT_HANDOVER_PENDING,
-            CUSTOM_RESULT_TOP_HOLD,
+            CUSTOM_RESULT_CONTACT_PRESS,
         }:
             self.block_legacy_output()
 
@@ -1251,9 +1221,9 @@ class MyLinkMavlinkClient:
             self.log(f"[CUSTOM1] accepted request={ack.project_request_id}; PX4 owns control")
         elif result == CUSTOM_RESULT_BUTTON_CONSUMED:
             self.clear_search_top_active()
-        elif result == CUSTOM_RESULT_TOP_HOLD:
+        elif result == CUSTOM_RESULT_CONTACT_PRESS:
             self.clear_search_top_active()
-            self.log("[TOP_HOLD] PX4 confirmed the top-distance threshold; holding position")
+            self.log("[CONTACT_PRESS] PX4 confirmed stable contact; pressure ramp active")
         elif result == CUSTOM_RESULT_HANDOVER_PENDING:
             self.clear_search_top_active()
             with self._project_lock:
@@ -1901,14 +1871,6 @@ def self_test() -> None:
     packet = TOP_DISTANCE_PACKET.pack(TOP_DISTANCE_MAGIC, TOP_DISTANCE_VERSION, 0x0F, 7, 1234, 10, 20, 30, 40)
     frame = decode_top_distance_packet(packet, received_at=1.0)
     assert frame.sequence == 7 and frame.distances_mm == (10, 20, 30, 40)
-    client = MyLinkMavlinkClient(DEFAULT_CONNECTION)
-    reports = []
-    client._write_custom = reports.append
-    client._top_distance_frame = frame
-    client._send_pending_top_distances()
-    assert len(reports) == 4
-    assert reports[-1].get_type() == "PING" and reports[-1].target_component == CUSTOM_COMPONENT
-    assert reports[0].seq == TOP_DISTANCE_VALID_MASK | TOP_DISTANCE_PROTOCOL_MARKER | (7 << 16) | 10
     controller_names = set(dir(MyLinkController))
     assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
     assert "simulate_laser_signal" not in controller_names
@@ -1923,6 +1885,7 @@ def self_test() -> None:
     assert "DEFAULT_CONNECTION" in source
     assert "CUSTOM_ACTION_REBASE_COMPLETE" in source
     assert "TOP_DISTANCE_PACKET" in source
+    assert "_send_pending_top_distances" not in source
     assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
     assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
     print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")

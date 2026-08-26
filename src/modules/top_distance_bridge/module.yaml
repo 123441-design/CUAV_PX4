@@ -1,0 +1,6 @@
+module_name: Top Distance Bridge
+serial_config:
+  - command: top_distance_bridge start -d ${SERIAL_DEV} -b p:${BAUD_PARAM}
+    port_config_param:
+      name: TDB_CONFIG
+      group: Top Distance Bridge

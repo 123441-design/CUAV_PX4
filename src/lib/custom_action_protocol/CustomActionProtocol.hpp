@@ -10,14 +10,23 @@ namespace custom_action_protocol
 {
 constexpr uint16_t kMavCmdUser1 = 31010;
 constexpr uint8_t kComponentId = 25; // MAV_COMP_ID_USER1
-// PING.seq carries one measured top distance. Four PING packets with the same
-// 12-bit sequence form one sensor frame. Bit 28 is a protocol-version marker,
-// so an obsolete top-contact boolean packet cannot be mistaken for distance.
-constexpr uint32_t kTopDistancePingValidMask = 1u << 31;
-constexpr uint32_t kTopDistancePingSensorMask = 3u << 29;
-constexpr uint32_t kTopDistancePingVersionMask = 1u << 28;
-constexpr uint32_t kTopDistancePingSequenceMask = 0x0FFFu << 16;
-constexpr uint32_t kTopDistancePingMillimetresMask = 0xFFFFu;
+
+// Current top-distance wire format: one targeted PING carries all four
+// millimetre measurements in PING.time_usec (one uint16_t per sensor).
+// PING.seq carries an unambiguous marker, version, validity mask and frame
+// sequence. The marker/version pair prevents unrelated targeted PING messages
+// from being interpreted as sensor data.
+constexpr uint32_t kTopDistanceArrayMarkerMask = 0xF0000000u;
+constexpr uint32_t kTopDistanceArrayMarker = 0xA0000000u;
+constexpr uint32_t kTopDistanceArrayVersionMask = 0x0F000000u;
+constexpr uint32_t kTopDistanceArrayVersion = 0x01000000u;
+constexpr uint32_t kTopDistanceArrayValidMask = 0x00F00000u;
+constexpr uint8_t kTopDistanceArrayValidShift = 20;
+constexpr uint32_t kTopDistanceArrayReservedMask = 0x000F0000u;
+constexpr uint32_t kTopDistanceArraySequenceMask = 0x0000FFFFu;
+constexpr uint8_t kTopDistanceArrayDistanceBits = 16;
+constexpr uint64_t kTopDistanceArrayMillimetresMask = 0xFFFFu;
+
 constexpr uint8_t kTopDistanceSensorCount = 4;
 
 enum class Command : uint8_t {
@@ -42,7 +51,7 @@ enum class Result : uint8_t {
 	LegacyAllowed = 3,
 	RebaseAccepted = 4,
 	HandoverPending = 5,
-	TopHoldEntered = 6,
+	ContactPressEntered = 6,
 };
 
 constexpr int32_t encodeResult(uint16_t request_id, Result result)

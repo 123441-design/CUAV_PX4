@@ -1,0 +1,5 @@
+menuconfig MODULES_TOP_DISTANCE_BRIDGE
+	bool "top_distance_bridge"
+	default n
+	---help---
+		Enable the dedicated four-laser MAVLink receiver.

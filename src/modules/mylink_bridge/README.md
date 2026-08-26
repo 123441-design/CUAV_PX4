@@ -5,7 +5,8 @@ binary MAVLink 1/2 byte stream with the generated PX4 MAVLink C library. It
 does not accept newline-delimited text commands.
 
 On CUAV V6X this firmware assigns TELEM2 (`/dev/ttyS4`) to the bridge at
-115200 baud and disables the MAVLink telemetry instance on TELEM2. USB MAVLink
+115200 baud. The independent `top_distance_bridge` owns TELEM1 for the physical
+four-laser stream. USB MAVLink
 remains available for QGC.
 
 ## Receive gate and event flags
@@ -51,7 +52,7 @@ Event bits:
 
 | Message | Behaviour after the gate opens |
 | --- | --- |
-| `PING` (ID 4) | Returns a targeted binary MAVLink `PING` response. |
+| `PING` (ID 4) | Standard target `0/0` is echoed. Targeted responses are not echoed again. |
 | `COMMAND_LONG` (ID 76) | Decodes an allowed command and sets its event bit. |
 | `COMMAND_INT` (ID 75) | Returns `COMMAND_ACK/MAV_RESULT_COMMAND_LONG_ONLY`. |
 | `SET_POSITION_TARGET_LOCAL_NED` (ID 84) | Prewarms Offboard; publishes velocity/position setpoint only while Active. |
