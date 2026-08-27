@@ -29,7 +29,24 @@ else
 fi
 
 # If not standalone launch the world
+start_gz_gui=""
+gz_gui_pid=""
+
 if [ -z "${PX4_GZ_STANDALONE}" ]; then
+	# WSLg exposes the Windows GPU through Mesa's D3D12 Gallium driver.
+	# Select it automatically so the normal PX4 make command does not fall
+	# back to llvmpipe software rendering. Explicit user settings still win.
+	if [ -e /dev/dxg ] && [ -f /usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so ]; then
+		if [ -z "${GALLIUM_DRIVER}" ]; then
+			export GALLIUM_DRIVER=d3d12
+		fi
+
+		if [ -z "${MESA_D3D12_DEFAULT_ADAPTER_NAME}" ]; then
+			export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+		fi
+
+		echo "INFO  [init] WSL Gazebo renderer: ${GALLIUM_DRIVER} ${MESA_D3D12_DEFAULT_ADAPTER_NAME}"
+	fi
 
 	# Look for an already running world
 	gz_world=$( ${gz_command} topic -l | grep -m 1 -e "^/world/.*/clock" | sed 's/\/world\///g; s/\/clock//g' )
@@ -57,28 +74,28 @@ if [ -z "${PX4_GZ_STANDALONE}" ]; then
 
 		${gz_command} ${gz_sub_command} --verbose=${GZ_VERBOSE:=1} -r -s "${PX4_GZ_WORLDS}/${PX4_GZ_WORLD}.sdf" &
 		gz_server_pid=$!
-		gz_gui_pid=""
 
 		if [ -z "${HEADLESS}" ]; then
-			echo "INFO  [init] Starting gz gui"
-			${gz_command} ${gz_sub_command} -g > /dev/null 2>&1 &
-			gz_gui_pid=$!
+			start_gz_gui=yes
 		fi
 
 		# The CMake launcher owns this file and uses it to clean up only the
 		# Gazebo processes started by the current PX4 simulation session.
 		if [ -n "${PX4_GZ_PID_FILE}" ]; then
 			printf '%s\n' "${gz_server_pid}" > "${PX4_GZ_PID_FILE}"
-
-			if [ -n "${gz_gui_pid}" ]; then
-				printf '%s\n' "${gz_gui_pid}" >> "${PX4_GZ_PID_FILE}"
-			fi
 		fi
 
 	else
 		# Gazebo is already running
 		echo "INFO  [init] gazebo already running world: ${gz_world}"
 		PX4_GZ_WORLD=${gz_world}
+
+		# A previous headless/server-only session may still own the world. The
+		# regular make command must still open a GUI instead of silently attaching
+		# PX4 to that invisible server.
+		if [ -z "${HEADLESS}" ] && ! pgrep -f "[g]z sim.*-g" > /dev/null 2>&1; then
+			start_gz_gui=yes
+		fi
 	fi
 
 else
@@ -114,6 +131,19 @@ while [ $ATTEMPTS -gt 0 ]; do
 	echo "INFO  [init] Waiting for Gazebo world..."
 	sleep 1
 done
+
+# Starting the GUI before the server advertises scene/info is unreliable on
+# WSLg and can make the window disappear immediately. Launch it only after the
+# world is ready, in its own session, and retain its output for diagnosis.
+if [ "${start_gz_gui}" = "yes" ]; then
+	echo "INFO  [init] Starting gz gui"
+	setsid ${gz_command} ${gz_sub_command} -g > /tmp/px4-gz-gui.log 2>&1 &
+	gz_gui_pid=$!
+
+	if [ -n "${PX4_GZ_PID_FILE}" ]; then
+		printf '%s\n' "${gz_gui_pid}" >> "${PX4_GZ_PID_FILE}"
+	fi
+fi
 
 # World is ready, check if custom location is provided
 if [ -n "${PX4_HOME_LAT}" ] || [ -n "${PX4_HOME_LON}" ] || [ -n "${PX4_HOME_ALT}" ]; then

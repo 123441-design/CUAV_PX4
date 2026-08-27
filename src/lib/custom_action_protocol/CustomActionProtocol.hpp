@@ -29,6 +29,23 @@ constexpr uint64_t kTopDistanceArrayMillimetresMask = 0xFFFFu;
 
 constexpr uint8_t kTopDistanceSensorCount = 4;
 
+// Normalized motor-monitor format: one targeted PING carries Motor1..Motor4
+// as four uint16_t values in PING.time_usec. A value of 1000 represents a
+// normalized actuator command of 1.000. PING.seq uses a marker distinct from
+// top-distance reports and includes validity, armed state and a frame counter.
+constexpr uint32_t kMotorOutputArrayMarkerMask = 0xF0000000u;
+constexpr uint32_t kMotorOutputArrayMarker = 0xB0000000u;
+constexpr uint32_t kMotorOutputArrayVersionMask = 0x0F000000u;
+constexpr uint32_t kMotorOutputArrayVersion = 0x01000000u;
+constexpr uint32_t kMotorOutputArrayValidMask = 0x00F00000u;
+constexpr uint8_t kMotorOutputArrayValidShift = 20;
+constexpr uint32_t kMotorOutputArrayArmedFlag = 0x00010000u;
+constexpr uint32_t kMotorOutputArrayReservedMask = 0x000E0000u;
+constexpr uint32_t kMotorOutputArraySequenceMask = 0x0000FFFFu;
+constexpr uint8_t kMotorOutputArrayValueBits = 16;
+constexpr uint16_t kMotorOutputArrayScale = 1000;
+constexpr uint8_t kMotorOutputCount = 4;
+
 enum class Command : uint8_t {
 	SearchTop = 1,
 	DirectionIntent = 2,

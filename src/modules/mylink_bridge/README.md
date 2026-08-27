@@ -9,6 +9,35 @@ On CUAV V6X this firmware assigns TELEM2 (`/dev/ttyS4`) to the bridge at
 four-laser stream. USB MAVLink
 remains available for QGC.
 
+## Four-distance monitoring output
+
+The bridge also subscribes to the unified `top_distance` uORB topic. Once an
+upper computer is present, it sends the newest four-sensor frame over the same
+MyLink transport at no more than 10 Hz. Real hardware therefore follows
+TELEM1/`top_distance_bridge` -> uORB -> TELEM2/WiFi, while SITL follows Gazebo
+four sensors -> `gz_bridge` -> uORB -> UDP port 14541. No separate SITL relay
+script is required.
+
+All four millimetre values remain in one MAVLink 2 `PING` frame using the same
+marker/version/validity/sequence layout accepted by `top_distance_bridge`.
+Sensor order is front-right, front-left, rear-right, rear-left; the V3.1 GUI
+reorders these for display as left-up, right-up, left-down, right-down.
+
+## Four-motor monitoring output
+
+The bridge also samples `actuator_motors.control[0..3]` and sends Motor1 through
+Motor4 in one MAVLink 2 `PING` frame at no more than 10 Hz. Each value is
+clamped to `0.000..1.000` and encoded as an unsigned 16-bit integer where
+`1000` means `1.000`. The metadata uses marker `0xB`, protocol version 1, four
+validity bits, an armed flag and a 16-bit sequence number. When PX4 is disarmed,
+all four channels are explicitly reported as `0.000`; missing or stale armed
+samples are marked invalid.
+
+The V3.1 GUI displays the four values and percentage bars. If no new frame is
+received for 0.5 seconds, it shows dashes and grey bars. These values are PX4's
+normalized commands to the motors, not measured RPM. Measured speed would
+require ESC telemetry supported by the installed ESCs.
+
 ## Receive gate and event flags
 
 The serial port is opened and MAVLink framing and CRC are checked from boot.

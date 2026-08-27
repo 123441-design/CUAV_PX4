@@ -45,6 +45,7 @@
 #include <uORB/topics/custom_action_status.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/trajectory_setpoint.h>
+#include <uORB/topics/top_distance.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
 #include <uORB/topics/vehicle_control_mode.h>
@@ -137,11 +138,15 @@ private:
 			    uint8_t target_system, uint8_t target_component);
 	void relayVehicleCommandAcks();
 	void sendVehicleCommandAck(const vehicle_command_ack_s &ack);
+	void relayTopDistance();
+	void relayMotorOutputs();
 
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 	uORB::Subscription _custom_action_status_sub{ORB_ID(custom_action_status)};
 	uORB::Subscription _vehicle_command_ack_sub{ORB_ID(vehicle_command_ack)};
+	uORB::Subscription _top_distance_sub{ORB_ID(top_distance)};
+	uORB::Subscription _actuator_motors_sub{ORB_ID(actuator_motors)};
 	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
@@ -177,6 +182,8 @@ private:
 	uint32_t _custom_action_commands{0};
 	uint32_t _legacy_setpoints_blocked{0};
 	uint32_t _relayed_command_acks{0};
+	uint32_t _relayed_top_distance_frames{0};
+	uint32_t _relayed_motor_output_frames{0};
 	uint32_t _invalid_setpoints{0};
 	uint32_t _motor_test_commands{0};
 	uint32_t _invalid_motor_test_commands{0};
@@ -195,6 +202,9 @@ private:
 	bool _cache_valid{false};
 	bool _setpoint_cache_valid{false};
 	hrt_abstime _last_setpoint_rx{0};
+	hrt_abstime _last_top_distance_tx{0};
+	hrt_abstime _last_motor_output_tx{0};
+	uint16_t _motor_output_sequence{0};
 	bool _was_armed{false};
 	bool _commander_owns_control{false};
 	custom_action_status_s _custom_action_status{};

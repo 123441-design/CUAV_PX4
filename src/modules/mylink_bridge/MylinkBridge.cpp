@@ -65,6 +65,9 @@ constexpr float kMotorTestMaximumTimeoutSeconds = 3.f;
 constexpr uint8_t kMotorTestThrottlePercent = 0;
 constexpr int kDirectMotorCount = 4;
 constexpr hrt_abstime kDirectMotorStopHold = 100_ms;
+constexpr hrt_abstime kTopDistanceTxInterval = 100_ms;
+constexpr hrt_abstime kMotorOutputTxInterval = 100_ms;
+constexpr hrt_abstime kMotorOutputSampleTimeout = 500_ms;
 }
 
 ModuleBase::Descriptor MylinkBridge::desc{task_spawn, custom_command, print_usage};
@@ -263,6 +266,146 @@ void MylinkBridge::relayVehicleCommandAcks()
 			_relayed_command_acks++;
 		}
 	}
+}
+
+void MylinkBridge::relayTopDistance()
+{
+	// Wait until the upper computer has identified itself on this link. This
+	// also prevents consuming the newest uORB sample before a SITL UDP peer is
+	// available.
+	if (_remote_system == 0 || _remote_component == 0) {
+		return;
+	}
+
+#if defined(__PX4_POSIX)
+	if (_udp_port > 0 && !_udp_peer_valid) {
+		return;
+	}
+#endif
+
+	const hrt_abstime now = hrt_absolute_time();
+
+	// The flight controller continues to consume top_distance at the sensor
+	// rate. Only the monitoring copy is limited to 10 Hz to keep TELEM2 light.
+	if (_last_top_distance_tx != 0 && now - _last_top_distance_tx < kTopDistanceTxInterval) {
+		return;
+	}
+
+	top_distance_s report{};
+
+	if (!_top_distance_sub.update(&report) || report.timestamp == 0) {
+		return;
+	}
+
+	uint64_t packed_distances = 0;
+	uint8_t valid_mask = 0;
+
+	for (uint8_t sensor_id = 0;
+	     sensor_id < custom_action_protocol::kTopDistanceSensorCount;
+	     ++sensor_id) {
+		const uint8_t sensor_bit = 1u << sensor_id;
+		const float distance_m = report.distance_m[sensor_id];
+
+		if ((report.valid_mask & sensor_bit) == 0 || !PX4_ISFINITE(distance_m) || distance_m <= 0.f) {
+			continue;
+		}
+
+		const long distance_mm = lroundf(distance_m * 1000.f);
+
+		if (distance_mm <= 0 || distance_mm > static_cast<long>(UINT16_MAX)) {
+			continue;
+		}
+
+		packed_distances |= static_cast<uint64_t>(distance_mm)
+				    << (sensor_id * custom_action_protocol::kTopDistanceArrayDistanceBits);
+		valid_mask |= sensor_bit;
+	}
+
+	const uint32_t metadata = custom_action_protocol::kTopDistanceArrayMarker
+				  | custom_action_protocol::kTopDistanceArrayVersion
+				  | (static_cast<uint32_t>(valid_mask)
+				     << custom_action_protocol::kTopDistanceArrayValidShift)
+				  | (static_cast<uint32_t>(report.sequence)
+				     & custom_action_protocol::kTopDistanceArraySequenceMask);
+
+	vehicle_status_s status{};
+	_vehicle_status_sub.copy(&status);
+	const uint8_t system_id = status.system_id > 0 ? status.system_id : 1;
+	mavlink_message_t message{};
+	mavlink_msg_ping_pack_status(system_id, custom_action_protocol::kComponentId,
+				     &_tx_status, &message, packed_distances, metadata,
+				     _remote_system, static_cast<uint8_t>(_remote_component));
+	sendMavlinkMessage(message);
+	_last_top_distance_tx = now;
+	_relayed_top_distance_frames++;
+}
+
+void MylinkBridge::relayMotorOutputs()
+{
+	if (_remote_system == 0 || _remote_component == 0) {
+		return;
+	}
+
+#if defined(__PX4_POSIX)
+	if (_udp_port > 0 && !_udp_peer_valid) {
+		return;
+	}
+#endif
+
+	const hrt_abstime now = hrt_absolute_time();
+
+	if (_last_motor_output_tx != 0 && now - _last_motor_output_tx < kMotorOutputTxInterval) {
+		return;
+	}
+
+	vehicle_status_s vehicle_status{};
+	const bool status_available = _vehicle_status_sub.copy(&vehicle_status) && vehicle_status.timestamp != 0;
+	const bool armed = status_available
+			   && vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+	actuator_motors_s motors{};
+	const bool motors_available = _actuator_motors_sub.copy(&motors) && motors.timestamp != 0;
+	const bool motors_fresh = motors_available && now >= motors.timestamp
+				  && now - motors.timestamp <= kMotorOutputSampleTimeout;
+	uint64_t packed_outputs = 0;
+	uint8_t valid_mask = 0;
+
+	for (uint8_t motor_index = 0;
+	     motor_index < custom_action_protocol::kMotorOutputCount;
+	     ++motor_index) {
+		float normalized = 0.f;
+		bool valid = status_available && !armed;
+
+		if (armed && motors_fresh && PX4_ISFINITE(motors.control[motor_index])) {
+			normalized = math::constrain(motors.control[motor_index], 0.f, 1.f);
+			valid = true;
+		}
+
+		if (valid) {
+			const uint16_t scaled = static_cast<uint16_t>(lroundf(
+						custom_action_protocol::kMotorOutputArrayScale * normalized));
+			packed_outputs |= static_cast<uint64_t>(scaled)
+					  << (motor_index * custom_action_protocol::kMotorOutputArrayValueBits);
+			valid_mask |= 1u << motor_index;
+		}
+	}
+
+	_motor_output_sequence++;
+	const uint32_t metadata = custom_action_protocol::kMotorOutputArrayMarker
+				  | custom_action_protocol::kMotorOutputArrayVersion
+				  | (static_cast<uint32_t>(valid_mask)
+				     << custom_action_protocol::kMotorOutputArrayValidShift)
+				  | (armed ? custom_action_protocol::kMotorOutputArrayArmedFlag : 0u)
+				  | (static_cast<uint32_t>(_motor_output_sequence)
+				     & custom_action_protocol::kMotorOutputArraySequenceMask);
+
+	const uint8_t system_id = vehicle_status.system_id > 0 ? vehicle_status.system_id : 1;
+	mavlink_message_t message{};
+	mavlink_msg_ping_pack_status(system_id, custom_action_protocol::kComponentId,
+				     &_tx_status, &message, packed_outputs, metadata,
+				     _remote_system, static_cast<uint8_t>(_remote_component));
+	sendMavlinkMessage(message);
+	_last_motor_output_tx = now;
+	_relayed_motor_output_frames++;
 }
 
 void MylinkBridge::handlePing(const mavlink_message_t &message)
@@ -948,6 +1091,8 @@ void MylinkBridge::Run()
 		perf_count(_loop_interval_perf);
 		updateGateAndCachedMessage();
 		relayVehicleCommandAcks();
+		relayTopDistance();
+		relayMotorOutputs();
 		readUdp();
 		perf_end(_loop_perf);
 		return;
@@ -969,6 +1114,8 @@ void MylinkBridge::Run()
 	perf_count(_loop_interval_perf);
 	updateGateAndCachedMessage();
 	relayVehicleCommandAcks();
+	relayTopDistance();
+	relayMotorOutputs();
 	readSerial();
 	perf_end(_loop_perf);
 }
@@ -1082,6 +1229,14 @@ int MylinkBridge::print_status()
 		 " ack_relayed=%" PRIu32,
 		 _custom_action_commands, _custom_action_status.control_owner, _custom_action_status.state,
 		 _custom_action_status.handover_id, _legacy_setpoints_blocked, _relayed_command_acks);
+	PX4_INFO("top_distance: relayed=%" PRIu32 " rate_limit=10Hz last_tx_age_ms=%" PRIu64,
+		 _relayed_top_distance_frames,
+		 _last_top_distance_tx > 0 && hrt_absolute_time() >= _last_top_distance_tx
+		 ? (hrt_absolute_time() - _last_top_distance_tx) / 1000 : 0);
+	PX4_INFO("motor_output: relayed=%" PRIu32 " rate_limit=10Hz last_tx_age_ms=%" PRIu64,
+		 _relayed_motor_output_frames,
+		 _last_motor_output_tx > 0 && hrt_absolute_time() >= _last_motor_output_tx
+		 ? (hrt_absolute_time() - _last_motor_output_tx) / 1000 : 0);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,

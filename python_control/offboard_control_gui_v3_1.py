@@ -51,6 +51,25 @@ TOP_DISTANCE_UDP_PORT = 14600
 TOP_DISTANCE_MAGIC = b"V3LD"
 TOP_DISTANCE_VERSION = 1
 TOP_DISTANCE_PACKET = struct.Struct("!4sBBHQ4H")
+TOP_DISTANCE_ARRAY_MARKER_MASK = 0xF0000000
+TOP_DISTANCE_ARRAY_MARKER = 0xA0000000
+TOP_DISTANCE_ARRAY_VERSION_MASK = 0x0F000000
+TOP_DISTANCE_ARRAY_VERSION = 0x01000000
+TOP_DISTANCE_ARRAY_VALID_MASK = 0x00F00000
+TOP_DISTANCE_ARRAY_VALID_SHIFT = 20
+TOP_DISTANCE_ARRAY_RESERVED_MASK = 0x000F0000
+TOP_DISTANCE_ARRAY_SEQUENCE_MASK = 0x0000FFFF
+MOTOR_OUTPUT_ARRAY_MARKER_MASK = 0xF0000000
+MOTOR_OUTPUT_ARRAY_MARKER = 0xB0000000
+MOTOR_OUTPUT_ARRAY_VERSION_MASK = 0x0F000000
+MOTOR_OUTPUT_ARRAY_VERSION = 0x01000000
+MOTOR_OUTPUT_ARRAY_VALID_MASK = 0x00F00000
+MOTOR_OUTPUT_ARRAY_VALID_SHIFT = 20
+MOTOR_OUTPUT_ARRAY_ARMED_FLAG = 0x00010000
+MOTOR_OUTPUT_ARRAY_RESERVED_MASK = 0x000E0000
+MOTOR_OUTPUT_ARRAY_SEQUENCE_MASK = 0x0000FFFF
+MOTOR_OUTPUT_ARRAY_SCALE = 1000
+MOTOR_OUTPUT_STALE_S = 0.5
 XY_MAX_SPEED_M_S = 0.10
 XY_MAX_ACCEL_M_S2 = 0.30
 Z_MAX_SPEED_UP_M_S = 0.30
@@ -171,8 +190,11 @@ class MyLinkState:
     battery_voltage_v: float | None = None
     heartbeat_age_s: float | None = None
     local_position_age_s: float | None = None
-    top_distances_m: tuple[float | None, float | None, float | None, float | None] = (None, None, None, None)
+    # Wire/uORB order: front-right, front-left, rear-right, rear-left.
+    top_distances_mm: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
     top_distance_age_s: float | None = None
+    motor_outputs_normalized: tuple[float | None, float | None, float | None, float | None] = (None, None, None, None)
+    motor_output_age_s: float | None = None
     rx_counts: tuple[tuple[str, int], ...] = ()
     tx_setpoints: int = 0
     error: str = ""
@@ -187,19 +209,77 @@ class TopDistanceFrame:
     received_at: float
 
 
+@dataclass(frozen=True)
+class MotorOutputFrame:
+    sequence: int
+    valid_mask: int
+    armed: bool
+    outputs_scaled: tuple[int, int, int, int]
+    received_at: float
+
+
 def decode_top_distance_packet(payload: bytes, received_at: float | None = None) -> TopDistanceFrame:
     if len(payload) != TOP_DISTANCE_PACKET.size:
         raise ValueError(f"unexpected lidar packet size {len(payload)}")
     magic, version, valid_mask, sequence, timestamp_us, *distances_mm = TOP_DISTANCE_PACKET.unpack(payload)
     if magic != TOP_DISTANCE_MAGIC or version != TOP_DISTANCE_VERSION:
         raise ValueError("unknown lidar packet protocol")
-    if valid_mask & ~0x0F or sequence & ~0x0FFF:
+    if valid_mask & ~0x0F:
         raise ValueError("invalid lidar packet fields")
     return TopDistanceFrame(
         sequence=sequence,
         timestamp_us=timestamp_us,
         valid_mask=valid_mask,
         distances_mm=tuple(distances_mm),
+        received_at=time.monotonic() if received_at is None else received_at,
+    )
+
+
+def decode_top_distance_mavlink(message, received_at: float | None = None) -> TopDistanceFrame | None:
+    """Decode the project one-frame/four-distance MAVLink PING transport."""
+    if message.get_type() != "PING":
+        return None
+    metadata = int(message.seq)
+    if (
+        metadata & TOP_DISTANCE_ARRAY_MARKER_MASK != TOP_DISTANCE_ARRAY_MARKER
+        or metadata & TOP_DISTANCE_ARRAY_VERSION_MASK != TOP_DISTANCE_ARRAY_VERSION
+        or metadata & TOP_DISTANCE_ARRAY_RESERVED_MASK
+    ):
+        return None
+    valid_mask = (metadata & TOP_DISTANCE_ARRAY_VALID_MASK) >> TOP_DISTANCE_ARRAY_VALID_SHIFT
+    packed_distances = int(message.time_usec)
+    distances_mm = tuple((packed_distances >> (sensor_id * 16)) & 0xFFFF for sensor_id in range(4))
+    return TopDistanceFrame(
+        sequence=metadata & TOP_DISTANCE_ARRAY_SEQUENCE_MASK,
+        timestamp_us=0,
+        valid_mask=valid_mask,
+        distances_mm=distances_mm,
+        received_at=time.monotonic() if received_at is None else received_at,
+    )
+
+
+def decode_motor_output_mavlink(message, received_at: float | None = None) -> MotorOutputFrame | None:
+    """Decode one MyLink MAVLink packet containing four normalized motor outputs."""
+    if message.get_type() != "PING":
+        return None
+    metadata = int(message.seq)
+    if (
+        metadata & MOTOR_OUTPUT_ARRAY_MARKER_MASK != MOTOR_OUTPUT_ARRAY_MARKER
+        or metadata & MOTOR_OUTPUT_ARRAY_VERSION_MASK != MOTOR_OUTPUT_ARRAY_VERSION
+        or metadata & MOTOR_OUTPUT_ARRAY_RESERVED_MASK
+    ):
+        return None
+    valid_mask = (metadata & MOTOR_OUTPUT_ARRAY_VALID_MASK) >> MOTOR_OUTPUT_ARRAY_VALID_SHIFT
+    packed_outputs = int(message.time_usec)
+    outputs_scaled = tuple((packed_outputs >> (motor_index * 16)) & 0xFFFF for motor_index in range(4))
+    for motor_index, output in enumerate(outputs_scaled):
+        if output > MOTOR_OUTPUT_ARRAY_SCALE:
+            valid_mask &= ~(1 << motor_index)
+    return MotorOutputFrame(
+        sequence=metadata & MOTOR_OUTPUT_ARRAY_SEQUENCE_MASK,
+        valid_mask=valid_mask,
+        armed=bool(metadata & MOTOR_OUTPUT_ARRAY_ARMED_FLAG),
+        outputs_scaled=outputs_scaled,
         received_at=time.monotonic() if received_at is None else received_at,
     )
 
@@ -626,6 +706,10 @@ class MyLinkMavlinkClient:
         self._top_distance_frame: TopDistanceFrame | None = None
         self._top_distance_rx_count = 0
         self._top_distance_logged = False
+        self._motor_lock = threading.Lock()
+        self._motor_output_frame: MotorOutputFrame | None = None
+        self._motor_output_rx_count = 0
+        self._motor_output_logged = False
 
     def start(self, timeout_s: float = 12.0) -> None:
         if self._connection is not None:
@@ -657,6 +741,8 @@ class MyLinkMavlinkClient:
         self._search_top_active = False
         with self._lidar_lock:
             self._top_distance_frame = None
+        with self._motor_lock:
+            self._motor_output_frame = None
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
@@ -708,13 +794,16 @@ class MyLinkMavlinkClient:
             heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
             local_age = None if self._last_local_position is None else now - self._last_local_position
             distances, top_age = self._top_distance_snapshot(now)
+            motor_outputs, motor_age = self._motor_output_snapshot(now)
             return replace(
                 self._state,
                 connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
                 heartbeat_age_s=heartbeat_age,
                 local_position_age_s=local_age,
-                top_distances_m=distances,
+                top_distances_mm=distances,
                 top_distance_age_s=top_age,
+                motor_outputs_normalized=motor_outputs,
+                motor_output_age_s=motor_age,
                 rx_counts=tuple(sorted(self._rx_counts.items())),
                 tx_setpoints=self._setpoint_count,
             )
@@ -741,13 +830,16 @@ class MyLinkMavlinkClient:
         heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
         local_age = None if self._last_local_position is None else now - self._last_local_position
         distances, top_age = self._top_distance_snapshot(now)
+        motor_outputs, motor_age = self._motor_output_snapshot(now)
         return replace(
             self._state,
             connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
             heartbeat_age_s=heartbeat_age,
             local_position_age_s=local_age,
-            top_distances_m=distances,
+            top_distances_mm=distances,
             top_distance_age_s=top_age,
+            motor_outputs_normalized=motor_outputs,
+            motor_output_age_s=motor_age,
             rx_counts=tuple(sorted(self._rx_counts.items())),
             tx_setpoints=self._setpoint_count,
         )
@@ -941,27 +1033,72 @@ class MyLinkMavlinkClient:
             connection.mav.send(message, force_mavlink1=False)
 
     def _send_heartbeat(self) -> None:
-        self._write(self._mav.heartbeat_encode(
+        heartbeat = self._mav.heartbeat_encode(
             mavlink2.MAV_TYPE_GCS,
             mavlink2.MAV_AUTOPILOT_INVALID,
             0,
             0,
             mavlink2.MAV_STATE_ACTIVE,
-        ))
+        )
+        self._write(heartbeat)
+        # In SITL, MyLink is a dedicated UDP side channel. A heartbeat makes
+        # its return peer known immediately so monitoring data arrives before
+        # the operator presses SEARCH TOP. Real hardware uses the primary
+        # TELEM2/WiFi connection and therefore sends only once.
+        if self._custom_connection is not None:
+            self._write_custom(heartbeat)
         self._heartbeat_tx_count += 1
 
     def _top_distance_snapshot(
         self, now: float
-    ) -> tuple[tuple[float | None, float | None, float | None, float | None], float | None]:
+    ) -> tuple[tuple[int | None, int | None, int | None, int | None], float | None]:
         with self._lidar_lock:
             frame = self._top_distance_frame
         if frame is None:
             return (None, None, None, None), None
         distances = tuple(
-            millimetres * 0.001 if frame.valid_mask & (1 << sensor_id) else None
+            millimetres if frame.valid_mask & (1 << sensor_id) else None
             for sensor_id, millimetres in enumerate(frame.distances_mm)
         )
         return distances, max(0.0, now - frame.received_at)
+
+    def _accept_top_distance_frame(self, frame: TopDistanceFrame, source: str) -> None:
+        with self._lidar_lock:
+            previous = self._top_distance_frame
+            if previous is not None and previous.sequence == frame.sequence:
+                return
+            self._top_distance_frame = frame
+            self._top_distance_rx_count += 1
+        if not self._top_distance_logged:
+            self._top_distance_logged = True
+            self.log(f"[LIDAR] four-distance stream received via {source}")
+
+    def _motor_output_snapshot(
+        self, now: float
+    ) -> tuple[tuple[float | None, float | None, float | None, float | None], float | None]:
+        with self._motor_lock:
+            frame = self._motor_output_frame
+        if frame is None:
+            return (None, None, None, None), None
+        age = max(0.0, now - frame.received_at)
+        if age > MOTOR_OUTPUT_STALE_S:
+            return (None, None, None, None), age
+        outputs = tuple(
+            scaled / MOTOR_OUTPUT_ARRAY_SCALE if frame.valid_mask & (1 << motor_index) else None
+            for motor_index, scaled in enumerate(frame.outputs_scaled)
+        )
+        return outputs, age
+
+    def _accept_motor_output_frame(self, frame: MotorOutputFrame, source: str) -> None:
+        with self._motor_lock:
+            previous = self._motor_output_frame
+            if previous is not None and previous.sequence == frame.sequence:
+                return
+            self._motor_output_frame = frame
+            self._motor_output_rx_count += 1
+        if not self._motor_output_logged:
+            self._motor_output_logged = True
+            self.log(f"[MOTOR] normalized four-motor stream received via {source}")
 
     def _lidar_receive_loop(self) -> None:
         while not self._stop.is_set():
@@ -979,15 +1116,7 @@ class MyLinkMavlinkClient:
             except ValueError as exc:
                 self.log(f"[LIDAR] ignored packet: {exc}")
                 continue
-            with self._lidar_lock:
-                previous = self._top_distance_frame
-                if previous is not None and previous.sequence == frame.sequence:
-                    continue
-                self._top_distance_frame = frame
-                self._top_distance_rx_count += 1
-            if not self._top_distance_logged:
-                self._top_distance_logged = True
-                self.log(f"[LIDAR] four-distance stream received on UDP {self.lidar_udp_port}")
+            self._accept_top_distance_frame(frame, f"legacy UDP {self.lidar_udp_port}")
 
     def _send_setpoint(self) -> None:
         if not self._legacy_output_allowed:
@@ -1137,6 +1266,13 @@ class MyLinkMavlinkClient:
     def _handle_message(self, message) -> None:
         name = message.get_type()
         now = time.monotonic()
+        if name == "PING":
+            top_distance_frame = decode_top_distance_mavlink(message, received_at=now)
+            if top_distance_frame is not None:
+                self._accept_top_distance_frame(top_distance_frame, "MyLink MAVLink")
+            motor_output_frame = decode_motor_output_mavlink(message, received_at=now)
+            if motor_output_frame is not None:
+                self._accept_motor_output_frame(motor_output_frame, "MyLink MAVLink")
         if name == "HEARTBEAT" and (
             int(message.type) == mavlink2.MAV_TYPE_GCS
             or int(message.autopilot) == mavlink2.MAV_AUTOPILOT_INVALID
@@ -1621,10 +1757,12 @@ class OffboardControlGuiV3:
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
             "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
-            "battery_row": "电池", "top_distance_row": "顶部距离", "target_row": "最终目标", "command_row": "当前指令",
+            "battery_row": "电池", "top_distance_row": "顶部距离", "motor_output_row": "电机归一化输出",
+            "target_row": "最终目标", "command_row": "当前指令",
             "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
             "mode": "模式", "armed": "解锁状态", "armed_yes": "已解锁", "armed_no": "未解锁",
             "heartbeat": "心跳", "north": "北", "east": "东", "down_axis": "下", "speed": "速度",
+            "front_left": "左上", "front_right": "右上", "rear_left": "左下", "rear_right": "右下",
         },
         "en": {
             "title": "PX4 MyLink Offboard Console V3.1", "connection": "MAVLink UDP connection",
@@ -1634,10 +1772,13 @@ class OffboardControlGuiV3:
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
             "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
-            "battery_row": "Battery", "top_distance_row": "Top distance", "target_row": "Final target", "command_row": "Command",
+            "battery_row": "Battery", "top_distance_row": "Top distance", "motor_output_row": "Normalized motors",
+            "target_row": "Final target", "command_row": "Command",
             "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
             "mode": "mode", "armed": "armed", "armed_yes": "True", "armed_no": "False",
             "heartbeat": "heartbeat", "north": "N", "east": "E", "down_axis": "D", "speed": "v",
+            "front_left": "Front-left", "front_right": "Front-right",
+            "rear_left": "Rear-left", "rear_right": "Rear-right",
         },
     }
 
@@ -1656,7 +1797,10 @@ class OffboardControlGuiV3:
         self.position_var = tk.StringVar(value="N —  E —  D —")
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
-        self.top_distance_var = tk.StringVar(value="FR —  FL —  RR —  RL —")
+        self.top_distance_var = tk.StringVar(value="左上 —  右上 —  左下 —  右下 — mm")
+        self.motor_output_vars = tuple(tk.DoubleVar(value=0.0) for _ in range(4))
+        self.motor_output_text_vars = tuple(tk.StringVar(value=f"M{index + 1} —") for index in range(4))
+        self.motor_output_age_var = tk.StringVar(value="age=—s")
         self.target_var = tk.StringVar(value="N —  E —  D —")
         self.command_var = tk.StringVar(value="N —  E —  D — | v —")
         self._closing = False
@@ -1681,8 +1825,8 @@ class OffboardControlGuiV3:
     def _build(self) -> None:
         root = self.root
         root.title(self.tr("title"))
-        root.geometry("1100x720")
-        root.minsize(920, 620)
+        root.geometry("1100x770")
+        root.minsize(920, 670)
         style = ttk.Style(root)
         try:
             style.theme_use("clam")
@@ -1691,6 +1835,8 @@ class OffboardControlGuiV3:
         style.configure("TButton", padding=(9, 6), font=("Segoe UI", 10))
         style.configure("TLabel", font=("Segoe UI", 10))
         style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("Motor.Valid.Horizontal.TProgressbar", troughcolor="#d9d9d9", background="#2eaf5d")
+        style.configure("Motor.Stale.Horizontal.TProgressbar", troughcolor="#d9d9d9", background="#9e9e9e")
         root.columnconfigure(0, weight=1)
         root.columnconfigure(1, weight=1)
         root.rowconfigure(2, weight=1)
@@ -1717,9 +1863,34 @@ class OffboardControlGuiV3:
             (self.tr("velocity_row"), self.velocity_var),
             (self.tr("battery_row"), self.battery_var),
             (self.tr("top_distance_row"), self.top_distance_var),
+        )):
+            ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
+        ttk.Label(status, text=self.tr("motor_output_row") + ":", width=16).grid(row=5, column=0, sticky="nw", pady=2)
+        motor_frame = ttk.Frame(status)
+        motor_frame.grid(row=5, column=1, sticky="ew", pady=2)
+        status.columnconfigure(1, weight=1)
+        self.motor_progressbars: list[ttk.Progressbar] = []
+        for motor_index in range(4):
+            motor_frame.columnconfigure(motor_index, weight=1)
+            cell = ttk.Frame(motor_frame)
+            cell.grid(row=0, column=motor_index, sticky="ew", padx=(0, 8))
+            ttk.Label(cell, textvariable=self.motor_output_text_vars[motor_index], font=("Consolas", 9)).grid(row=0, column=0, sticky="w")
+            progress = ttk.Progressbar(
+                cell,
+                maximum=MOTOR_OUTPUT_ARRAY_SCALE,
+                variable=self.motor_output_vars[motor_index],
+                style="Motor.Stale.Horizontal.TProgressbar",
+                length=135,
+            )
+            progress.grid(row=1, column=0, sticky="ew")
+            cell.columnconfigure(0, weight=1)
+            self.motor_progressbars.append(progress)
+        ttk.Label(motor_frame, textvariable=self.motor_output_age_var, font=("Consolas", 9)).grid(row=0, column=4, rowspan=2, sticky="w")
+        for row, (name, variable) in enumerate((
             (self.tr("target_row"), self.target_var),
             (self.tr("command_row"), self.command_var),
-        )):
+        ), start=6):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
 
@@ -1773,6 +1944,10 @@ class OffboardControlGuiV3:
     def _fmt(value: float | None) -> str:
         return "—" if value is None else f"{value:.2f}"
 
+    @staticmethod
+    def _fmt_mm(value: int | None) -> str:
+        return "—" if value is None else str(int(value))
+
     def _refresh(self) -> None:
         if self._closing:
             return
@@ -1794,11 +1969,34 @@ class OffboardControlGuiV3:
             f"{self.tr('down_axis')} {self._fmt(state.vz)} m/s"
         )
         self.battery_var.set(f"{state.battery_percent if state.battery_percent is not None else '—'}%  {self._fmt(state.battery_voltage_v)}V")
-        labels = ("FR", "FL", "RR", "RL")
-        top_values = "  ".join(
-            f"{label} {self._fmt(value)}" for label, value in zip(labels, state.top_distances_m)
+        # Sensor/uORB order is FR, FL, RR, RL. Present it spatially in the
+        # requested GUI order: left-up, right-up, left-down, right-down.
+        front_right, front_left, rear_right, rear_left = state.top_distances_mm
+        display_distances = (
+            (self.tr("front_left"), front_left),
+            (self.tr("front_right"), front_right),
+            (self.tr("rear_left"), rear_left),
+            (self.tr("rear_right"), rear_right),
         )
-        self.top_distance_var.set(f"{top_values} m | age={self._fmt(state.top_distance_age_s)}s")
+        top_values = "  ".join(
+            f"{label} {self._fmt_mm(value)}" for label, value in display_distances
+        )
+        self.top_distance_var.set(f"{top_values} mm | age={self._fmt(state.top_distance_age_s)}s")
+        motor_stale = state.motor_output_age_s is None or state.motor_output_age_s > MOTOR_OUTPUT_STALE_S
+        for motor_index, output in enumerate(state.motor_outputs_normalized):
+            progress = self.motor_progressbars[motor_index]
+            if motor_stale or output is None:
+                self.motor_output_vars[motor_index].set(0.0)
+                self.motor_output_text_vars[motor_index].set(f"M{motor_index + 1} —")
+                progress.configure(style="Motor.Stale.Horizontal.TProgressbar")
+            else:
+                normalized = min(max(float(output), 0.0), 1.0)
+                self.motor_output_vars[motor_index].set(normalized * MOTOR_OUTPUT_ARRAY_SCALE)
+                self.motor_output_text_vars[motor_index].set(
+                    f"M{motor_index + 1} {normalized:.3f} ({normalized * 100:.1f}%)"
+                )
+                progress.configure(style="Motor.Valid.Horizontal.TProgressbar")
+        self.motor_output_age_var.set(f"age={self._fmt(state.motor_output_age_s)}s")
         target = self.controller.target
         axes = (self.tr("north"), self.tr("east"), self.tr("down_axis"))
         self.target_var.set(
@@ -1871,6 +2069,30 @@ def self_test() -> None:
     packet = TOP_DISTANCE_PACKET.pack(TOP_DISTANCE_MAGIC, TOP_DISTANCE_VERSION, 0x0F, 7, 1234, 10, 20, 30, 40)
     frame = decode_top_distance_packet(packet, received_at=1.0)
     assert frame.sequence == 7 and frame.distances_mm == (10, 20, 30, 40)
+    metadata = TOP_DISTANCE_ARRAY_MARKER | TOP_DISTANCE_ARRAY_VERSION | (0x0F << TOP_DISTANCE_ARRAY_VALID_SHIFT) | 8
+    packed_distances = 10 | (20 << 16) | (30 << 32) | (40 << 48)
+    mavlink_distance = mavlink2.MAVLink(None).ping_encode(packed_distances, metadata, SOURCE_SYSTEM, SOURCE_COMPONENT)
+    mavlink_frame = decode_top_distance_mavlink(mavlink_distance, received_at=2.0)
+    assert mavlink_frame is not None
+    assert mavlink_frame.sequence == 8 and mavlink_frame.distances_mm == (10, 20, 30, 40)
+    motor_metadata = (
+        MOTOR_OUTPUT_ARRAY_MARKER
+        | MOTOR_OUTPUT_ARRAY_VERSION
+        | (0x0F << MOTOR_OUTPUT_ARRAY_VALID_SHIFT)
+        | MOTOR_OUTPUT_ARRAY_ARMED_FLAG
+        | 9
+    )
+    packed_outputs = 0 | (250 << 16) | (742 << 32) | (1000 << 48)
+    mavlink_motor = mavlink2.MAVLink(None).ping_encode(packed_outputs, motor_metadata, SOURCE_SYSTEM, SOURCE_COMPONENT)
+    motor_frame = decode_motor_output_mavlink(mavlink_motor, received_at=3.0)
+    assert motor_frame is not None and motor_frame.armed
+    assert motor_frame.sequence == 9 and motor_frame.outputs_scaled == (0, 250, 742, 1000)
+    monitor = MyLinkMavlinkClient("udp:127.0.0.1:14540")
+    monitor._accept_motor_output_frame(motor_frame, "self-test")
+    fresh_outputs, fresh_age = monitor._motor_output_snapshot(3.2)
+    assert fresh_outputs == (0.0, 0.25, 0.742, 1.0) and math.isclose(fresh_age, 0.2)
+    stale_outputs, stale_age = monitor._motor_output_snapshot(3.6)
+    assert stale_outputs == (None, None, None, None) and math.isclose(stale_age, 0.6)
     controller_names = set(dir(MyLinkController))
     assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
     assert "simulate_laser_signal" not in controller_names
@@ -1888,7 +2110,7 @@ def self_test() -> None:
     assert "_send_pending_top_distances" not in source
     assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
     assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
-    print("GUI V3 self-test: UDP API, CUSTOM1 protocol and rebase helpers OK; no connection opened")
+    print("GUI V3 self-test: UDP API, distance/motor monitoring, CUSTOM1 and rebase helpers OK; no connection opened")
 
 
 def main() -> None:
