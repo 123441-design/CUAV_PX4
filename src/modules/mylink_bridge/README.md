@@ -1,22 +1,22 @@
-# MyLink MAVLink bridge
+# Project telemetry and optional MyLink bridge
 
-`mylink_bridge` owns the serial port selected by `MLB_CONFIG` and parses a
-binary MAVLink 1/2 byte stream with the generated PX4 MAVLink C library. It
-does not accept newline-delimited text commands.
+The CUAV V6X production configuration uses the standard PX4 MAVLink instance
+on TELEM2 (`/dev/ttyS4`) at 57600 baud. `mylink_bridge` is disabled by default
+(`MLB_CONFIG=0`) so it cannot compete for the same UART. The independent
+`top_distance_bridge` owns TELEM1 (`/dev/ttyS6`) at 115200 baud for the
+physical four-laser stream.
 
-On CUAV V6X this firmware assigns TELEM2 (`/dev/ttyS4`) to the bridge at
-115200 baud. The independent `top_distance_bridge` owns TELEM1 for the physical
-four-laser stream. USB MAVLink
-remains available for QGC.
+`mylink_bridge` remains available as an optional serial owner on a different,
+free port. It parses a binary MAVLink 1/2 byte stream with the generated PX4
+MAVLink C library and does not accept newline-delimited text commands.
 
 ## Four-distance monitoring output
 
-The bridge also subscribes to the unified `top_distance` uORB topic. Once an
-upper computer is present, it sends the newest four-sensor frame over the same
-MyLink transport at no more than 10 Hz. Real hardware therefore follows
-TELEM1/`top_distance_bridge` -> uORB -> TELEM2/WiFi, while SITL follows Gazebo
-four sensors -> `gz_bridge` -> uORB -> UDP port 14541. No separate SITL relay
-script is required.
+The standard MAVLink `PING` stream subscribes to the unified `top_distance`
+uORB topic and sends the newest four-sensor frame at no more than 10 Hz. Real
+hardware therefore follows TELEM1/`top_distance_bridge` -> uORB -> standard
+MAVLink on TELEM2/WiFi. SITL follows Gazebo four sensors -> `gz_bridge` -> uORB
+-> the normal MAVLink UDP link. No separate SITL relay script is required.
 
 All four millimetre values remain in one MAVLink 2 `PING` frame using the same
 marker/version/validity/sequence layout accepted by `top_distance_bridge`.
@@ -25,20 +25,36 @@ reorders these for display as left-up, right-up, left-down, right-down.
 
 ## Four-motor monitoring output
 
-The bridge also samples `actuator_motors.control[0..3]` and sends Motor1 through
-Motor4 in one MAVLink 2 `PING` frame at no more than 10 Hz. Each value is
-clamped to `0.000..1.000` and encoded as an unsigned 16-bit integer where
-`1000` means `1.000`. The metadata uses marker `0xB`, protocol version 1, four
-validity bits, an armed flag and a 16-bit sequence number. When PX4 is disarmed,
-all four channels are explicitly reported as `0.000`; missing or stale armed
-samples are marked invalid.
+On CUAV V6X, the same standard MAVLink stream samples the physical
+`actuator_outputs` PWM channels after output mapping and limiting. The current
+aircraft mapping (`MAIN1=M4`, `MAIN2=M3`, `MAIN3=M1`, `MAIN4=M2`) is reordered
+into Motor1 through Motor4 and sent in one MAVLink 2 `PING` frame at no more
+than 10 Hz. Each value is a uint16 PWM pulse width in microseconds. The metadata
+uses marker `0xB`, protocol version 2, four validity bits, an armed flag and a
+16-bit sequence number. Missing, stale or out-of-range output samples are
+marked invalid. SITL has no physical PWM pins and reports a 1000..2000 us
+equivalent derived from the logical motor command.
 
-The V3.1 GUI displays the four values and percentage bars. If no new frame is
-received for 0.5 seconds, it shows dashes and grey bars. These values are PX4's
-normalized commands to the motors, not measured RPM. Measured speed would
-require ESC telemetry supported by the installed ESCs.
+The V3.1 GUI displays the four PWM commands and bars. If no new frame is
+received for 0.5 seconds, it shows dashes and grey bars. These values are the
+closest output commands available without ESC telemetry, but they do not prove
+that an ESC received the pulse and are not measured RPM.
+
+## SEARCH_TOP state monitoring
+
+The same standard MAVLink `PING` stream forwards every `custom_action_status`
+update (normally 2 Hz). Marker `0xC`, protocol version 1 carries controller
+state, control owner, active flag, exit reason, handover id and a frame counter.
+The V3.1 GUI displays `SEARCH_TOP`, `TOP_APPROACH`, `CONTACT_VERIFY` and
+`CONTACT_PRESS` separately, logs every transition, and marks the state stale
+after 1.5 seconds without a new frame. This periodic report is authoritative;
+the initial command ACK means only that SEARCH_TOP started.
 
 ## Receive gate and event flags
+
+The remaining sections describe the optional `mylink_bridge`. They apply only
+when `MLB_CONFIG` is assigned to a free serial port; it must not share TELEM2
+with `MAV_1_CONFIG`.
 
 The serial port is opened and MAVLink framing and CRC are checked from boot.
 

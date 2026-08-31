@@ -42,6 +42,7 @@
 
 #include <lib/airspeed/airspeed.h>
 #include <lib/conversion/rotation.h>
+#include <lib/custom_action_protocol/CustomActionProtocol.hpp>
 #include <lib/systemlib/px4_macros.h>
 
 #include <math.h>
@@ -486,8 +487,12 @@ void MavlinkReceiver::handle_messages_in_gimbal_mode(mavlink_message_t &msg)
 bool
 MavlinkReceiver::evaluate_target_ok(int command, int target_system, int target_component)
 {
-	return ((target_system == 0) || (target_system == mavlink_system.sysid))
-	       && ((target_component == mavlink_system.compid) || (target_component == MAV_COMP_ID_ALL));
+	const bool system_ok = (target_system == 0) || (target_system == mavlink_system.sysid);
+	const bool component_ok = (target_component == mavlink_system.compid) || (target_component == MAV_COMP_ID_ALL);
+	const bool custom_action_ok = (command == custom_action_protocol::kMavCmdUser1)
+				      && (target_component == custom_action_protocol::kComponentId);
+
+	return system_ok && (component_ok || custom_action_ok);
 }
 
 void

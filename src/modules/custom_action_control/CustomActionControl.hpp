@@ -94,6 +94,7 @@ private:
 	float _filtered_top_distance{NAN};
 	float _verify_min_distance{NAN};
 	float _verify_max_distance{NAN};
+	uint8_t _contact_threshold_frames{0};
 	uint8_t _heading_reset_counter{0};
 	hrt_abstime _search_started{0};
 	uint16_t _last_top_distance_sequence{0};

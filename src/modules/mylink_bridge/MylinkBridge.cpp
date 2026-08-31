@@ -381,9 +381,12 @@ void MylinkBridge::relayMotorOutputs()
 		}
 
 		if (valid) {
-			const uint16_t scaled = static_cast<uint16_t>(lroundf(
-						custom_action_protocol::kMotorOutputArrayScale * normalized));
-			packed_outputs |= static_cast<uint64_t>(scaled)
+			// The dedicated MyLink transport is used by SITL, where there are no
+			// physical PWM pins. Report a conventional PWM-equivalent command.
+			const uint16_t pwm_us = static_cast<uint16_t>(lroundf(
+						custom_action_protocol::kMotorPwmSimMinimumUs
+						+ custom_action_protocol::kMotorPwmSimRangeUs * normalized));
+			packed_outputs |= static_cast<uint64_t>(pwm_us)
 					  << (motor_index * custom_action_protocol::kMotorOutputArrayValueBits);
 			valid_mask |= 1u << motor_index;
 		}

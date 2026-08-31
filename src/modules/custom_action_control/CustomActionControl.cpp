@@ -23,6 +23,7 @@ namespace
 constexpr hrt_abstime kRunInterval = 20_ms;
 constexpr hrt_abstime kLocalPositionTimeout = 500_ms;
 constexpr hrt_abstime kStatusInterval = 500_ms;
+constexpr uint8_t kContactThresholdFramesRequired = 3;
 const char *reasonName(uint8_t reason)
 {
 	switch (reason) {
@@ -203,6 +204,7 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	_filtered_top_distance = minimumTopDistance();
 	_verify_min_distance = NAN;
 	_verify_max_distance = NAN;
+	_contact_threshold_frames = 0;
 	_verify_started = 0;
 	_press_started = 0;
 	_handover_started = 0;
@@ -228,6 +230,7 @@ void CustomActionControl::beginHandover(uint8_t reason, uint16_t handover_id,
 	_handover_started = hrt_absolute_time();
 	_verify_started = 0;
 	_press_started = 0;
+	_contact_threshold_frames = 0;
 	PX4_WARN("[CUSTOM] handover id=%u reason=%s(%u) hold=(%.2f, %.2f, %.2f)",
 		 _handover_id, reasonName(reason), reason,
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z);
@@ -330,7 +333,9 @@ void CustomActionControl::enterTopApproach()
 	_verify_started = 0;
 	_verify_min_distance = NAN;
 	_verify_max_distance = NAN;
-	PX4_INFO("[TOP_FOUND] distance=%.3f m; slow approach", (double)_filtered_top_distance);
+	_contact_threshold_frames = 0;
+	PX4_INFO("[TOP_FOUND] raw=%.3f filtered=%.3f m; slow approach",
+		 (double)minimumTopDistance(), (double)_filtered_top_distance);
 	publishStatus(true);
 }
 
@@ -340,7 +345,10 @@ void CustomActionControl::enterContactVerify(hrt_abstime now)
 	_verify_started = now;
 	_verify_min_distance = _filtered_top_distance;
 	_verify_max_distance = _filtered_top_distance;
-	PX4_INFO("[CONTACT_VERIFY] distance=%.3f m", (double)_filtered_top_distance);
+	_contact_threshold_frames = 0;
+	PX4_INFO("[CONTACT_VERIFY] raw=%.3f filtered=%.3f m after %u consecutive raw frames",
+		 (double)minimumTopDistance(), (double)_filtered_top_distance,
+		 (unsigned)kContactThresholdFramesRequired);
 	publishStatus(true);
 }
 
@@ -357,6 +365,7 @@ void CustomActionControl::enterContactPress(hrt_abstime now)
 	_reason = custom_action_status_s::REASON_TOP_DISTANCE;
 	_verify_started = 0;
 	_press_started = now;
+	_contact_threshold_frames = 0;
 	PX4_INFO("[CONTACT_PRESS] stable contact at z=%.2f; pressure ramp active", (double)_hold_z);
 	publishStatus(true);
 	publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
@@ -374,6 +383,7 @@ void CustomActionControl::releaseToLegacy(uint8_t reason)
 	_handover_started = 0;
 	_verify_started = 0;
 	_press_started = 0;
+	_contact_threshold_frames = 0;
 	_filtered_top_distance = NAN;
 	publishStatus(true);
 }
@@ -388,6 +398,7 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 	_handover_started = 0;
 	_verify_started = 0;
 	_press_started = 0;
+	_contact_threshold_frames = 0;
 	_filtered_top_distance = NAN;
 	PX4_INFO("[CUSTOM] control released to Commander: %s", reasonName(reason));
 	publishStatus(true);
@@ -400,7 +411,7 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 	offboard_control_mode_s control_mode{};
 	control_mode.timestamp = now;
 	control_mode.position = true;
-	control_mode.velocity = precontact;
+	control_mode.velocity = precontact || contact_press;
 	control_mode.acceleration = contact_press;
 	_offboard_control_mode_pub.publish(control_mode);
 
@@ -411,7 +422,7 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 	setpoint.position[2] = (precontact || contact_press) ? NAN : _hold_z;
 	setpoint.velocity[0] = NAN;
 	setpoint.velocity[1] = NAN;
-	setpoint.velocity[2] = precontact ? -activeClimbVelocity() : NAN;
+	setpoint.velocity[2] = precontact ? -activeClimbVelocity() : (contact_press ? 0.f : NAN);
 
 	for (int i = 0; i < 3; ++i) {
 		setpoint.acceleration[i] = NAN;
@@ -419,12 +430,14 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 	}
 
 	if (contact_press) {
-		const float elapsed = static_cast<float>(now - _press_started) * 1e-6f;
+		const float elapsed = now >= _press_started
+				      ? static_cast<float>(now - _press_started) * 1e-6f
+				      : 0.f;
 		const float thrust_offset = math::min(_param_press_add.get(), _param_press_ramp.get() * elapsed);
 		const float hover_thrust = math::max(_param_hover_thrust.get(), 0.05f);
-		// Mixed-axis PositionControl input: x/y remain position-controlled while z
-		// is a finite acceleration feed-forward. This retains attitude control and
-		// avoids an unreachable vertical position error and integrator wind-up.
+		// Keep the vertical velocity loop continuous with a reachable zero-velocity
+		// target, then add the pressure acceleration as feed-forward. This preserves
+		// the pre-contact thrust integrator without an unreachable position target.
 		setpoint.acceleration[2] = -CONSTANTS_ONE_G * thrust_offset / hover_thrust;
 	}
 
@@ -462,7 +475,6 @@ void CustomActionControl::Run()
 	}
 
 	updateParams();
-	const hrt_abstime now = hrt_absolute_time();
 	_vehicle_local_position_sub.update(&_local_position);
 	_vehicle_status_sub.update(&_vehicle_status);
 	const bool top_distance_updated = _top_distance_sub.update(&_top_distance);
@@ -472,6 +484,11 @@ void CustomActionControl::Run()
 	for (int i = 0; i < vehicle_command_s::ORB_QUEUE_LENGTH && _vehicle_command_sub.update(&command); ++i) {
 		handleCommand(command);
 	}
+
+	// Commands can create state timestamps using hrt_absolute_time(). Capture the
+	// cycle time afterwards so elapsed-time calculations can never start from an
+	// older timestamp and underflow hrt_abstime.
+	const hrt_abstime now = hrt_absolute_time();
 
 	const bool armed = _vehicle_status.timestamp != 0
 			   && _vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
@@ -516,7 +533,10 @@ void CustomActionControl::Run()
 			beginHandover(custom_action_status_s::REASON_MAX_DISTANCE, _active_request_id,
 				      _active_source_system, _active_source_component, true);
 
-		} else if (now - _search_started >= static_cast<hrt_abstime>(_param_top_time.get() * 1_s)) {
+		} else if (_search_started != 0 && now >= _search_started
+			   && now - _search_started >= static_cast<hrt_abstime>(_param_top_time.get() * 1_s)) {
+			PX4_WARN("[TOP_TIMEOUT] raw=%.3f filtered=%.3f m",
+				 (double)minimumTopDistance(), (double)_filtered_top_distance);
 			beginHandover(custom_action_status_s::REASON_TIMEOUT, _active_request_id,
 				      _active_source_system, _active_source_component, true);
 
@@ -527,15 +547,31 @@ void CustomActionControl::Run()
 		} else if (new_distance_frame && _state == custom_action_status_s::STATE_TOP_APPROACH) {
 			if (_filtered_top_distance > _param_top_gap.get() + _param_top_hysteresis.get()) {
 				_state = custom_action_status_s::STATE_SEARCH_TOP;
+				_contact_threshold_frames = 0;
 				PX4_INFO("[TOP_APPROACH] top lost; resume search");
 				publishStatus(true);
 
-			} else if (_filtered_top_distance <= _param_contact_distance.get()) {
-				enterContactVerify(now);
+			} else {
+				const float raw_minimum_distance = minimumTopDistance();
+
+				if (raw_minimum_distance <= _param_contact_distance.get()) {
+					if (_contact_threshold_frames < kContactThresholdFramesRequired) {
+						++_contact_threshold_frames;
+					}
+
+					if (_contact_threshold_frames >= kContactThresholdFramesRequired) {
+						enterContactVerify(now);
+					}
+
+				} else {
+					_contact_threshold_frames = 0;
+				}
 			}
 
 		} else if (new_distance_frame && _state == custom_action_status_s::STATE_CONTACT_VERIFY) {
-			if (_filtered_top_distance > _param_contact_distance.get() + _param_top_hysteresis.get()) {
+			const float raw_minimum_distance = minimumTopDistance();
+
+			if (raw_minimum_distance > _param_contact_distance.get() + _param_top_hysteresis.get()) {
 				enterTopApproach();
 
 			} else {
@@ -547,7 +583,8 @@ void CustomActionControl::Run()
 					_verify_min_distance = _filtered_top_distance;
 					_verify_max_distance = _filtered_top_distance;
 
-				} else if (now - _verify_started >= static_cast<hrt_abstime>(_param_contact_time.get() * 1_s)) {
+				} else if (_verify_started != 0 && now >= _verify_started
+					   && now - _verify_started >= static_cast<hrt_abstime>(_param_contact_time.get() * 1_s)) {
 					enterContactPress(now);
 				}
 			}
@@ -555,8 +592,11 @@ void CustomActionControl::Run()
 		}
 	}
 
+	const hrt_abstime handover_elapsed = (_handover_started != 0 && now >= _handover_started)
+					     ? now - _handover_started
+					     : 0;
 	const bool handover_output_allowed = _owner != custom_action_status_s::OWNER_HANDOVER
-		|| now - _handover_started < static_cast<hrt_abstime>(_param_handover_timeout.get() * 1_s);
+		|| handover_elapsed < static_cast<hrt_abstime>(_param_handover_timeout.get() * 1_s);
 
 	if ((_owner == custom_action_status_s::OWNER_CUSTOM
 	     || (_owner == custom_action_status_s::OWNER_HANDOVER && handover_output_allowed))

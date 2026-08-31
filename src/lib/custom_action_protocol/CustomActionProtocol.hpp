@@ -11,6 +11,10 @@ namespace custom_action_protocol
 constexpr uint16_t kMavCmdUser1 = 31010;
 constexpr uint8_t kComponentId = 25; // MAV_COMP_ID_USER1
 
+// Fixed identity used by the V3.1 upper computer on the dedicated WiFi link.
+constexpr uint8_t kUpperComputerSystemId = 42;
+constexpr uint8_t kUpperComputerComponentId = 191;
+
 // Current top-distance wire format: one targeted PING carries all four
 // millimetre measurements in PING.time_usec (one uint16_t per sensor).
 // PING.seq carries an unambiguous marker, version, validity mask and frame
@@ -29,22 +33,45 @@ constexpr uint64_t kTopDistanceArrayMillimetresMask = 0xFFFFu;
 
 constexpr uint8_t kTopDistanceSensorCount = 4;
 
-// Normalized motor-monitor format: one targeted PING carries Motor1..Motor4
-// as four uint16_t values in PING.time_usec. A value of 1000 represents a
-// normalized actuator command of 1.000. PING.seq uses a marker distinct from
-// top-distance reports and includes validity, armed state and a frame counter.
+// Motor PWM-monitor format: one targeted PING carries Motor1..Motor4 as four
+// uint16_t PWM pulse widths in microseconds in PING.time_usec. On CUAV V6X the
+// physical MAIN outputs are reordered into logical motor order before packing.
+// SITL has no physical PWM pins and reports a 1000..2000 us equivalent instead.
+// PING.seq uses a marker distinct from top-distance reports and includes
+// validity, armed state and a frame counter.
 constexpr uint32_t kMotorOutputArrayMarkerMask = 0xF0000000u;
 constexpr uint32_t kMotorOutputArrayMarker = 0xB0000000u;
 constexpr uint32_t kMotorOutputArrayVersionMask = 0x0F000000u;
-constexpr uint32_t kMotorOutputArrayVersion = 0x01000000u;
+constexpr uint32_t kMotorOutputArrayVersion = 0x02000000u;
 constexpr uint32_t kMotorOutputArrayValidMask = 0x00F00000u;
 constexpr uint8_t kMotorOutputArrayValidShift = 20;
 constexpr uint32_t kMotorOutputArrayArmedFlag = 0x00010000u;
 constexpr uint32_t kMotorOutputArrayReservedMask = 0x000E0000u;
 constexpr uint32_t kMotorOutputArraySequenceMask = 0x0000FFFFu;
 constexpr uint8_t kMotorOutputArrayValueBits = 16;
-constexpr uint16_t kMotorOutputArrayScale = 1000;
+constexpr uint16_t kMotorPwmMinimumUs = 500;
+constexpr uint16_t kMotorPwmMaximumUs = 2500;
+constexpr uint16_t kMotorPwmSimMinimumUs = 1000;
+constexpr uint16_t kMotorPwmSimRangeUs = 1000;
 constexpr uint8_t kMotorOutputCount = 4;
+
+// SEARCH_TOP status format. The controller publishes custom_action_status at
+// 2 Hz, and the MAVLink PING stream forwards every update. PING.seq carries
+// state/owner/reason plus a small frame counter; PING.time_usec carries the
+// current handover id. Repetition makes state display tolerant of WiFi/UDP
+// packet loss without adding a custom MAVLink dialect.
+constexpr uint32_t kCustomStatusMarkerMask = 0xF0000000u;
+constexpr uint32_t kCustomStatusMarker = 0xC0000000u;
+constexpr uint32_t kCustomStatusVersionMask = 0x0F000000u;
+constexpr uint32_t kCustomStatusVersion = 0x01000000u;
+constexpr uint32_t kCustomStatusStateMask = 0x00E00000u;
+constexpr uint8_t kCustomStatusStateShift = 21;
+constexpr uint32_t kCustomStatusOwnerMask = 0x00180000u;
+constexpr uint8_t kCustomStatusOwnerShift = 19;
+constexpr uint32_t kCustomStatusActiveFlag = 0x00040000u;
+constexpr uint32_t kCustomStatusReasonMask = 0x0003C000u;
+constexpr uint8_t kCustomStatusReasonShift = 14;
+constexpr uint32_t kCustomStatusSequenceMask = 0x00003FFFu;
 
 enum class Command : uint8_t {
 	SearchTop = 1,

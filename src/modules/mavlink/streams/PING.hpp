@@ -34,6 +34,19 @@
 #ifndef PING_HPP
 #define PING_HPP
 
+#include <lib/custom_action_protocol/CustomActionProtocol.hpp>
+#include <mathlib/mathlib.h>
+
+#include <uORB/Subscription.hpp>
+#if defined(__PX4_POSIX)
+#include <uORB/topics/actuator_motors.h>
+#else
+#include <uORB/topics/actuator_outputs.h>
+#endif
+#include <uORB/topics/custom_action_status.h>
+#include <uORB/topics/top_distance.h>
+#include <uORB/topics/vehicle_status.h>
+
 class MavlinkStreamPing : public MavlinkStream
 {
 public:
@@ -47,7 +60,7 @@ public:
 
 	unsigned get_size() override
 	{
-		return MAVLINK_MSG_ID_PING_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES;
+		return 3 * (MAVLINK_MSG_ID_PING_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES);
 	}
 
 	bool const_rate() override { return true; }
@@ -55,20 +68,175 @@ public:
 private:
 	explicit MavlinkStreamPing(Mavlink *mavlink) : MavlinkStream(mavlink) {}
 
-	uint32_t _sequence{0};
+	uORB::Subscription _top_distance_sub{ORB_ID(top_distance)};
+	uORB::Subscription _custom_action_status_sub{ORB_ID(custom_action_status)};
+	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+#if defined(__PX4_POSIX)
+	uORB::Subscription _motor_output_sub{ORB_ID(actuator_motors)};
+#else
+	uORB::Subscription _motor_output_sub{ORB_ID(actuator_outputs)};
+#endif
+	uint16_t _motor_sequence{0};
+	uint16_t _custom_status_sequence{0};
+	uint8_t _standard_ping_divider{0};
 
 	bool send() override
 	{
-		mavlink_ping_t msg{};
+		bool sent = send_top_distance();
+		sent = send_motor_outputs() || sent;
+		sent = send_custom_action_status() || sent;
 
-		msg.time_usec = hrt_absolute_time();
-		msg.seq = _sequence++;
-		msg.target_system = 0; // All systems
-		msg.target_component = 0; // All components
+		if (++_standard_ping_divider >= 100) {
+			_standard_ping_divider = 0;
+			mavlink_ping_t message{};
+			message.time_usec = hrt_absolute_time();
+			mavlink_msg_ping_send_struct(_mavlink->get_channel(), &message);
+			sent = true;
+		}
 
-		mavlink_msg_ping_send_struct(_mavlink->get_channel(), &msg);
+		return sent;
+	}
 
+	bool send_top_distance()
+	{
+		top_distance_s report{};
+
+		if (!_top_distance_sub.update(&report) || report.timestamp == 0) {
+			return false;
+		}
+
+		uint64_t packed = 0;
+		uint8_t valid_mask = 0;
+
+		for (uint8_t index = 0; index < custom_action_protocol::kTopDistanceSensorCount; ++index) {
+			const float distance_m = report.distance_m[index];
+			const uint8_t sensor_bit = 1u << index;
+
+			if ((report.valid_mask & sensor_bit) != 0 && PX4_ISFINITE(distance_m)
+			    && distance_m > 0.f && distance_m <= 65.535f) {
+				const uint16_t distance_mm = static_cast<uint16_t>(distance_m * 1000.f + 0.5f);
+				packed |= static_cast<uint64_t>(distance_mm)
+					  << (index * custom_action_protocol::kTopDistanceArrayDistanceBits);
+				valid_mask |= sensor_bit;
+			}
+		}
+
+		mavlink_ping_t message{};
+		message.time_usec = packed;
+		message.seq = custom_action_protocol::kTopDistanceArrayMarker
+			      | custom_action_protocol::kTopDistanceArrayVersion
+			      | (static_cast<uint32_t>(valid_mask) << custom_action_protocol::kTopDistanceArrayValidShift)
+			      | (static_cast<uint32_t>(report.sequence)
+				 & custom_action_protocol::kTopDistanceArraySequenceMask);
+		send_to_upper_computer(message);
 		return true;
+	}
+
+	bool send_custom_action_status()
+	{
+		custom_action_status_s status{};
+
+		if (!_custom_action_status_sub.update(&status) || status.timestamp == 0) {
+			return false;
+		}
+
+		mavlink_ping_t message{};
+		message.time_usec = status.handover_id;
+		message.seq = custom_action_protocol::kCustomStatusMarker
+			      | custom_action_protocol::kCustomStatusVersion
+			      | ((static_cast<uint32_t>(status.state) << custom_action_protocol::kCustomStatusStateShift)
+				 & custom_action_protocol::kCustomStatusStateMask)
+			      | ((static_cast<uint32_t>(status.control_owner) << custom_action_protocol::kCustomStatusOwnerShift)
+				 & custom_action_protocol::kCustomStatusOwnerMask)
+			      | (status.active ? custom_action_protocol::kCustomStatusActiveFlag : 0u)
+			      | ((static_cast<uint32_t>(status.reason) << custom_action_protocol::kCustomStatusReasonShift)
+				 & custom_action_protocol::kCustomStatusReasonMask)
+			      | (static_cast<uint32_t>(++_custom_status_sequence)
+				 & custom_action_protocol::kCustomStatusSequenceMask);
+		send_to_upper_computer(message);
+		return true;
+	}
+
+	bool send_motor_outputs()
+	{
+		vehicle_status_s status{};
+
+		if (!_vehicle_status_sub.copy(&status) || status.timestamp == 0) {
+			return false;
+		}
+
+		const bool armed = status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+		const hrt_abstime now = hrt_absolute_time();
+		uint64_t packed = 0;
+		uint8_t valid_mask = 0;
+
+#if defined(__PX4_POSIX)
+		// SITL has no physical PWM pins. Convert the logical motor command to a
+		// conventional PWM-equivalent value so the same UI and protocol can be
+		// exercised without presenting it as measured hardware feedback.
+		actuator_motors_s outputs{};
+		const bool fresh = _motor_output_sub.copy(&outputs) && outputs.timestamp != 0
+				   && now >= outputs.timestamp && now - outputs.timestamp <= 500000;
+#else
+		actuator_outputs_s outputs{};
+		const bool fresh = _motor_output_sub.copy(&outputs) && outputs.timestamp != 0
+				   && now >= outputs.timestamp && now - outputs.timestamp <= 500000;
+
+#if defined(CONFIG_ARCH_BOARD_CUAV_FMU_V6X)
+		// Current aircraft output functions:
+		// MAIN1=M4, MAIN2=M3, MAIN3=M1, MAIN4=M2.
+		static constexpr uint8_t output_by_motor[custom_action_protocol::kMotorOutputCount] {2, 3, 1, 0};
+#else
+		static constexpr uint8_t output_by_motor[custom_action_protocol::kMotorOutputCount] {0, 1, 2, 3};
+#endif
+#endif
+
+		for (uint8_t index = 0; index < custom_action_protocol::kMotorOutputCount; ++index) {
+			uint16_t pwm_us = 0;
+			bool valid = false;
+
+#if defined(__PX4_POSIX)
+			if (fresh && PX4_ISFINITE(outputs.control[index])) {
+				const float normalized = math::constrain(outputs.control[index], 0.f, 1.f);
+				pwm_us = static_cast<uint16_t>(custom_action_protocol::kMotorPwmSimMinimumUs
+						+ custom_action_protocol::kMotorPwmSimRangeUs * normalized + 0.5f);
+				valid = true;
+			}
+#else
+			const uint8_t output_index = output_by_motor[index];
+
+			if (fresh && output_index < outputs.noutputs && PX4_ISFINITE(outputs.output[output_index])) {
+				const float output = outputs.output[output_index];
+				valid = output >= custom_action_protocol::kMotorPwmMinimumUs
+					&& output <= custom_action_protocol::kMotorPwmMaximumUs;
+				pwm_us = valid ? static_cast<uint16_t>(output + 0.5f) : 0;
+			}
+#endif
+
+			if (valid) {
+				packed |= static_cast<uint64_t>(pwm_us)
+					  << (index * custom_action_protocol::kMotorOutputArrayValueBits);
+				valid_mask |= 1u << index;
+			}
+		}
+
+		mavlink_ping_t message{};
+		message.time_usec = packed;
+		message.seq = custom_action_protocol::kMotorOutputArrayMarker
+			      | custom_action_protocol::kMotorOutputArrayVersion
+			      | (static_cast<uint32_t>(valid_mask) << custom_action_protocol::kMotorOutputArrayValidShift)
+			      | (armed ? custom_action_protocol::kMotorOutputArrayArmedFlag : 0u)
+			      | (static_cast<uint32_t>(++_motor_sequence)
+				 & custom_action_protocol::kMotorOutputArraySequenceMask);
+		send_to_upper_computer(message);
+		return true;
+	}
+
+	void send_to_upper_computer(mavlink_ping_t &message)
+	{
+		message.target_system = custom_action_protocol::kUpperComputerSystemId;
+		message.target_component = custom_action_protocol::kUpperComputerComponentId;
+		mavlink_msg_ping_send_struct(_mavlink->get_channel(), &message);
 	}
 };
 
