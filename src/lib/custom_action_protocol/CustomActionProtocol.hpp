@@ -77,6 +77,7 @@ enum class Command : uint8_t {
 	SearchTop = 1,
 	DirectionIntent = 2,
 	RebaseComplete = 3,
+	DetachTop = 4,
 };
 
 enum class Direction : uint8_t {
@@ -96,6 +97,8 @@ enum class Result : uint8_t {
 	RebaseAccepted = 4,
 	HandoverPending = 5,
 	ContactPressEntered = 6,
+	DetachStarted = 7,
+	DetachComplete = 8,
 };
 
 constexpr int32_t encodeResult(uint16_t request_id, Result result)

@@ -139,6 +139,8 @@ MulticopterRateControl::Run()
 		/* check for updates in other topics */
 		_vehicle_control_mode_sub.update(&_vehicle_control_mode);
 
+		_custom_action_status_sub.update(&_custom_action_status);
+
 		if (_vehicle_land_detected_sub.updated()) {
 			vehicle_land_detected_s vehicle_land_detected;
 
@@ -187,9 +189,16 @@ MulticopterRateControl::Run()
 
 		// run the rate controller
 		if (_vehicle_control_mode.flag_control_rates_enabled) {
+			const bool custom_status_fresh = _custom_action_status.timestamp != 0
+				&& hrt_elapsed_time(&_custom_action_status.timestamp) < 1_s;
+			const bool custom_torque_limited = custom_status_fresh
+				&& _custom_action_status.control_owner == custom_action_status_s::OWNER_CUSTOM
+				&& (_custom_action_status.state == custom_action_status_s::STATE_CONTACT_PRESS
+				    || _custom_action_status.state == custom_action_status_s::STATE_PRESS_RELEASE);
 
 			// reset integral if disarmed
-			if (!_vehicle_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
+			if (!_vehicle_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING
+			    || custom_torque_limited) {
 				_rate_control.resetIntegral();
 			}
 
@@ -217,10 +226,17 @@ MulticopterRateControl::Run()
 
 			// run rate controller
 			Vector3f torque_setpoint =
-				_rate_control.update(rates, _rates_setpoint, angular_accel, dt, _maybe_landed || _landed);
+				_rate_control.update(rates, _rates_setpoint, angular_accel, dt,
+						     _maybe_landed || _landed || custom_torque_limited);
 
 			// apply low-pass filtering on yaw axis to reduce high frequency torque caused by rotor acceleration
 			torque_setpoint(2) = _output_lpf_yaw.update(torque_setpoint(2), dt);
+
+			if (custom_torque_limited) {
+				torque_setpoint.setZero();
+				_thrust_setpoint(0) = 0.f;
+				_thrust_setpoint(1) = 0.f;
+			}
 
 			// publish rate controller status
 			rate_ctrl_status_s rate_ctrl_status{};

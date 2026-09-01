@@ -100,6 +100,14 @@ parameters:
         max: 2.00
         default: 0.50
         decimal: 2
+      CUST_CNT_NUM:
+        description:
+          short: Required close top sensors
+          long: Number of upward sensors that must be inside CUST_CNT_DIST before contact verification starts.
+        type: int32
+        min: 1
+        max: 4
+        default: 3
       CUST_STAB_BND:
         description:
           short: Contact distance stability band
@@ -113,7 +121,7 @@ parameters:
       CUST_PRS_ADD:
         description:
           short: Contact thrust offset
-          long: Normalized thrust added above hover after stable contact. Attitude and horizontal position control remain active.
+          long: Normalized collective-thrust offset added after stable contact. Motor torque authority is removed during pressure hold.
         type: float
         min: 0.00
         max: 0.15
@@ -128,6 +136,81 @@ parameters:
         max: 0.20
         default: 0.05
         decimal: 3
+      CUST_REL_RAMP:
+        description:
+          short: Contact pressure release rate
+          long: Rate used to reduce the pressure offset from its current value to CUST_REL_HOLD before attitude balancing.
+        type: float
+        unit: 1/s
+        min: 0.01
+        max: 0.50
+        default: 0.10
+        decimal: 3
+      CUST_REL_HOLD:
+        description:
+          short: Pre-detach contact thrust offset
+          long: Small normalized collective-thrust offset retained while full attitude control and current-X/Y hold settle before descent.
+        type: float
+        min: 0.00
+        max: 0.05
+        default: 0.01
+        decimal: 3
+      CUST_REL_VEL:
+        description:
+          short: Initial detach downward speed
+        type: float
+        unit: m/s
+        min: 0.02
+        max: 0.30
+        default: 0.15
+        decimal: 2
+      CUST_REL_GAP:
+        description:
+          short: Relative clearance before LAND
+          long: LAND is requested after at least CUST_CNT_NUM upward distances increase by this amount from detach start, or local Z moves downward by this amount. Twice this value forces an immediate LAND request.
+        type: float
+        unit: m
+        min: 0.10
+        max: 0.50
+        default: 0.10
+        decimal: 2
+      CUST_REL_TIME:
+        description:
+          short: Relative-clearance confirmation time
+        type: float
+        unit: s
+        min: 0.10
+        max: 2.00
+        default: 0.10
+        decimal: 2
+      CUST_ATT_TIME:
+        description:
+          short: Pre-detach attitude confirmation time
+          long: Time that contact, roll/pitch angle and roll/pitch rate must remain inside their limits before downward detachment starts.
+        type: float
+        unit: s
+        min: 0.20
+        max: 3.00
+        default: 0.75
+        decimal: 2
+      CUST_BAL_ANG:
+        description:
+          short: Pre-detach roll/pitch angle limit
+        type: float
+        unit: deg
+        min: 0.5
+        max: 10.0
+        default: 2.0
+        decimal: 1
+      CUST_BAL_RATE:
+        description:
+          short: Pre-detach roll/pitch rate limit
+        type: float
+        unit: deg/s
+        min: 2.0
+        max: 60.0
+        default: 10.0
+        decimal: 1
       CUST_SENS_TO:
         description:
           short: Top-distance data timeout
@@ -140,7 +223,7 @@ parameters:
       CUST_HO_TIME:
         description:
           short: Handover HOLD output timeout
-          long: After this timeout the handover remains blocked, but internal Offboard output stops so normal Offboard-loss can occur if V3 is absent.
+          long: Used for non-LAND legacy handovers. Normal safe detach requests LAND directly and does not wait for this timeout.
         type: float
         unit: s
         min: 1.0

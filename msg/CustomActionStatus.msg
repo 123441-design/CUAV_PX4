@@ -7,6 +7,11 @@ uint8 STATE_SEARCH_TOP = 1
 uint8 STATE_TOP_APPROACH = 2
 uint8 STATE_CONTACT_VERIFY = 3
 uint8 STATE_CONTACT_PRESS = 4
+uint8 STATE_PRESS_RELEASE = 5
+uint8 STATE_CLEARANCE_DESCEND = 6
+# Full attitude and current-X/Y hold are restored here while a small
+# configurable contact preload is still applied.
+uint8 STATE_ATTITUDE_RECOVER = 7
 
 uint8 OWNER_LEGACY = 0
 uint8 OWNER_CUSTOM = 1
@@ -15,6 +20,7 @@ uint8 OWNER_COMMANDER = 3
 
 uint8 ACTION_NONE = 0
 uint8 ACTION_SEARCH_TOP = 1
+uint8 ACTION_DETACH_TOP = 2
 
 uint8 REASON_NONE = 0
 uint8 REASON_DIRECTION = 1
@@ -25,6 +31,7 @@ uint8 REASON_ESTIMATOR = 5
 uint8 REASON_HEADING_RESET = 6
 uint8 REASON_LAND = 7
 uint8 REASON_TOP_DISTANCE = 8
+uint8 REASON_CONTACT_LOST = 9
 
 uint8 state
 bool active

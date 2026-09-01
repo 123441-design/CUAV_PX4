@@ -239,6 +239,8 @@ void LoggedTopics::add_default_topics()
 	// additional control allocation logging
 	add_topic("actuator_motors", 100);
 	add_topic("actuator_servos", 100);
+	add_topic("custom_action_status", 100);
+	add_topic("top_distance", 100);
 	add_topic_multi("vehicle_thrust_setpoint", 20, 2);
 	add_topic_multi("vehicle_torque_setpoint", 20, 2);
 
