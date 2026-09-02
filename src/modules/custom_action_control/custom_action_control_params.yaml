@@ -113,7 +113,7 @@ parameters:
       CUST_PRS_ADD:
         description:
           short: Contact thrust offset
-          long: Normalized thrust added above hover after stable contact. Attitude and horizontal position control remain active.
+          long: Normalized thrust added above hover after stable contact. Attitude and yaw control remain active, while horizontal position control is released so thrust stays normal to a horizontal ceiling.
         type: float
         min: 0.00
         max: 0.15

@@ -417,8 +417,13 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 
 	trajectory_setpoint_s setpoint{};
 	setpoint.timestamp = now;
-	setpoint.position[0] = _hold_x;
-	setpoint.position[1] = _hold_y;
+	// Keep XY fixed while searching and approaching. Once contact pressure is
+	// active, remove horizontal position/velocity feedback and command zero
+	// horizontal acceleration instead. This keeps the desired thrust vector
+	// normal to a horizontal ceiling while the attitude/rate controllers remain
+	// fully active.
+	setpoint.position[0] = contact_press ? NAN : _hold_x;
+	setpoint.position[1] = contact_press ? NAN : _hold_y;
 	setpoint.position[2] = (precontact || contact_press) ? NAN : _hold_z;
 	setpoint.velocity[0] = NAN;
 	setpoint.velocity[1] = NAN;
@@ -430,6 +435,8 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 	}
 
 	if (contact_press) {
+		setpoint.acceleration[0] = 0.f;
+		setpoint.acceleration[1] = 0.f;
 		const float elapsed = now >= _press_started
 				      ? static_cast<float>(now - _press_started) * 1e-6f
 				      : 0.f;
