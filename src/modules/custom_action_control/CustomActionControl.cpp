@@ -24,6 +24,7 @@ constexpr hrt_abstime kRunInterval = 20_ms;
 constexpr hrt_abstime kLocalPositionTimeout = 500_ms;
 constexpr hrt_abstime kStatusInterval = 500_ms;
 constexpr uint8_t kContactThresholdFramesRequired = 3;
+constexpr uint8_t kContactSensorCountRequired = 3;
 const char *reasonName(uint8_t reason)
 {
 	switch (reason) {
@@ -109,6 +110,19 @@ float CustomActionControl::minimumTopDistance() const
 	return minimum_distance;
 }
 
+uint8_t CustomActionControl::topDistanceCountAtOrBelow(float threshold) const
+{
+	uint8_t count = 0;
+
+	for (float distance : _top_distance.distance_m) {
+		if (PX4_ISFINITE(distance) && distance <= threshold) {
+			++count;
+		}
+	}
+
+	return count;
+}
+
 void CustomActionControl::updateFilteredTopDistance()
 {
 	const float measured_distance = minimumTopDistance();
@@ -182,11 +196,39 @@ void CustomActionControl::publishAsyncAck(uint8_t result, uint8_t project_result
 void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint16_t request_id)
 {
 	const hrt_abstime now = hrt_absolute_time();
+	Result rejection = Result::None;
 
-	if (_owner != custom_action_status_s::OWNER_LEGACY || _state != custom_action_status_s::STATE_INACTIVE
-	    || !flightStateAllowsCustom() || !sensorFresh(now) || !captureHoldPoint()) {
+	if (_owner != custom_action_status_s::OWNER_LEGACY || _state != custom_action_status_s::STATE_INACTIVE) {
+		rejection = Result::StartBusy;
+
+	} else if (!_param_enabled.get()) {
+		rejection = Result::StartDisabled;
+
+	} else if (_vehicle_status.timestamp == 0
+		   || _vehicle_status.arming_state != vehicle_status_s::ARMING_STATE_ARMED) {
+		rejection = Result::StartNotArmed;
+
+	} else if (_vehicle_status.nav_state != vehicle_status_s::NAVIGATION_STATE_OFFBOARD) {
+		rejection = Result::StartNotOffboard;
+
+	} else if (!localStateValid() || !captureHoldPoint()) {
+		rejection = Result::StartEstimatorInvalid;
+
+	} else if (!sensorFresh(now)) {
+		rejection = Result::StartSensorInvalid;
+
+	} else if (!_param_close_start_enabled.get()
+		   && minimumTopDistance() <= (_param_top_gap.get() + _param_top_hysteresis.get())) {
+		// Normal flight must start outside the slow-approach threshold so a covered
+		// or contaminated sensor cannot make SEARCH_TOP begin next to contact.
+		// CUST_CLOSE_EN bypasses only this initial gate for controlled bench tests.
+		rejection = Result::StartDistanceTooClose;
+	}
+
+	if (rejection != Result::None) {
+		PX4_WARN("[SEARCH_TOP] start rejected: result=%u", (unsigned)rejection);
 		publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
-			   static_cast<uint8_t>(Result::None));
+			   static_cast<uint8_t>(rejection));
 		return;
 	}
 
@@ -561,7 +603,8 @@ void CustomActionControl::Run()
 			} else {
 				const float raw_minimum_distance = minimumTopDistance();
 
-				if (raw_minimum_distance <= _param_contact_distance.get()) {
+				if (raw_minimum_distance <= _param_contact_distance.get()
+				    && topDistanceCountAtOrBelow(_param_contact_distance.get()) >= kContactSensorCountRequired) {
 					if (_contact_threshold_frames < kContactThresholdFramesRequired) {
 						++_contact_threshold_frames;
 					}
@@ -578,7 +621,8 @@ void CustomActionControl::Run()
 		} else if (new_distance_frame && _state == custom_action_status_s::STATE_CONTACT_VERIFY) {
 			const float raw_minimum_distance = minimumTopDistance();
 
-			if (raw_minimum_distance > _param_contact_distance.get() + _param_top_hysteresis.get()) {
+			if (raw_minimum_distance > _param_contact_distance.get() + _param_top_hysteresis.get()
+			    || topDistanceCountAtOrBelow(_param_contact_distance.get()) < kContactSensorCountRequired) {
 				enterTopApproach();
 
 			} else {

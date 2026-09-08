@@ -96,6 +96,13 @@ enum class Result : uint8_t {
 	RebaseAccepted = 4,
 	HandoverPending = 5,
 	ContactPressEntered = 6,
+	StartBusy = 7,
+	StartDisabled = 8,
+	StartNotArmed = 9,
+	StartNotOffboard = 10,
+	StartEstimatorInvalid = 11,
+	StartSensorInvalid = 12,
+	StartDistanceTooClose = 13,
 };
 
 constexpr int32_t encodeResult(uint16_t request_id, Result result)

@@ -148,11 +148,14 @@ private:
 	uint8_t _system_id{1};
 	bool _rotary_wing{false};
 	bool _vtol{false};
+	uint8_t _nav_state{vehicle_status_s::NAVIGATION_STATE_MAX};
+	bool _offboard_takeover_sticks_blocked{false};
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::COM_RC_IN_MODE>) _param_com_rc_in_mode,
 		(ParamFloat<px4::params::COM_RC_LOSS_T>) _param_com_rc_loss_t,
 		(ParamFloat<px4::params::MAN_OVERRIDE_SPD>) _param_man_override_spd,
+		(ParamFloat<px4::params::MAN_DEADZONE>) _param_man_deadzone,
 		(ParamBool<px4::params::MAN_ARM_GESTURE>) _param_man_arm_gesture,
 		(ParamFloat<px4::params::MAN_KILL_GEST_T>) _param_man_kill_gest_t,
 		(ParamBool<px4::params::COM_ARM_SWISBTN>) _param_com_arm_swisbtn,

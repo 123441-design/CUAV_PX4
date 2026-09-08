@@ -10,6 +10,7 @@ module and its UART connection to TELEM2 are transparent to this application.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import math
 import queue
 import socket
@@ -46,6 +47,13 @@ CUSTOM_RESULT_LEGACY_ALLOWED = 3
 CUSTOM_RESULT_REBASE_ACCEPTED = 4
 CUSTOM_RESULT_HANDOVER_PENDING = 5
 CUSTOM_RESULT_CONTACT_PRESS = 6
+CUSTOM_RESULT_START_BUSY = 7
+CUSTOM_RESULT_START_DISABLED = 8
+CUSTOM_RESULT_START_NOT_ARMED = 9
+CUSTOM_RESULT_START_NOT_OFFBOARD = 10
+CUSTOM_RESULT_START_ESTIMATOR_INVALID = 11
+CUSTOM_RESULT_START_SENSOR_INVALID = 12
+CUSTOM_RESULT_START_DISTANCE_TOO_CLOSE = 13
 SETPOINT_RATE_HZ = 10.0
 TOP_DISTANCE_UDP_PORT = 14600
 TOP_DISTANCE_MAGIC = b"V3LD"
@@ -87,6 +95,8 @@ CUSTOM_STATUS_REASON_MASK = 0x0003C000
 CUSTOM_STATUS_REASON_SHIFT = 14
 CUSTOM_STATUS_SEQUENCE_MASK = 0x00003FFF
 CUSTOM_STATUS_STALE_S = 1.5
+TOP_MODE_POSITION_MAX_AGE_S = 1.0
+TOP_MODE_DISTANCE_MAX_AGE_S = 1.0
 CUSTOM_STATE_NAMES = {
     0: "INACTIVE",
     1: "SEARCH_TOP",
@@ -124,6 +134,15 @@ CUSTOM_REASON_ZH = {
     6: "航向发生重置",
     7: "执行降落",
     8: "顶部距离确认",
+}
+CUSTOM_START_RESULT_ZH = {
+    CUSTOM_RESULT_START_BUSY: "上一项触顶流程或控制交接尚未结束",
+    CUSTOM_RESULT_START_DISABLED: "CUST_TOP_EN未启用",
+    CUSTOM_RESULT_START_NOT_ARMED: "飞机尚未解锁",
+    CUSTOM_RESULT_START_NOT_OFFBOARD: "飞机当前不在OFFBOARD模式",
+    CUSTOM_RESULT_START_ESTIMATOR_INVALID: "本地位置或航向估计无效",
+    CUSTOM_RESULT_START_SENSOR_INVALID: "四路顶部激光数据不完整、无效或超时",
+    CUSTOM_RESULT_START_DISTANCE_TOO_CLOSE: "启动距离未超过缓慢贴顶安全门槛；请检查灰尘、遮挡或先远离顶部，台架测试可将CUST_CLOSE_EN设为1",
 }
 ACTION_NAME_ZH = {
     "CONNECT": "连接",
@@ -166,6 +185,8 @@ MAX_ALTITUDE_M = 3.0
 MIN_MOVE_M = 0.1
 MAX_MOVE_M = 5.0
 HEARTBEAT_TIMEOUT_S = 3.0
+GROUND_DISTANCE_RATE_HZ = 3.0
+LOCAL_POSITION_RATE_HZ = 5.0
 
 
 def load_saved_connection() -> str:
@@ -183,6 +204,58 @@ def save_successful_connection(connection_string: str) -> None:
     temporary = CONNECTION_SETTINGS_PATH.with_suffix(".tmp")
     temporary.write_text(connection + "\n", encoding="utf-8")
     temporary.replace(CONNECTION_SETTINGS_PATH)
+
+
+def discover_udp_connections(current: str = "") -> tuple[str, ...]:
+    """Return selectable MAVLink UDP listeners for every local IPv4 address."""
+    addresses: set[str] = set()
+
+    try:
+        import psutil
+
+        interface_stats = psutil.net_if_stats()
+        for interface_name, interface_addresses in psutil.net_if_addrs().items():
+            stats = interface_stats.get(interface_name)
+            if stats is not None and not stats.isup:
+                continue
+            for interface_address in interface_addresses:
+                if interface_address.family == socket.AF_INET:
+                    addresses.add(interface_address.address)
+    except (ImportError, OSError):
+        pass
+
+    try:
+        addresses.update(
+            item[4][0]
+            for item in socket.getaddrinfo(
+                socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+            )
+        )
+    except OSError:
+        pass
+
+    usable: list[ipaddress.IPv4Address] = []
+    for address in addresses:
+        try:
+            parsed = ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError:
+            continue
+        if not (
+            parsed.is_unspecified
+            or parsed.is_multicast
+            or parsed.is_loopback
+            or parsed.is_link_local
+        ):
+            usable.append(parsed)
+
+    options = [f"udp:{address}:14550" for address in sorted(set(usable))]
+    options.append(DEFAULT_CONNECTION)
+
+    selected = current.strip()
+    if selected.lower().startswith("udp:") and selected not in options:
+        options.insert(0, selected)
+
+    return tuple(options)
 
 
 def sitl_mylink_connection(connection_string: str) -> str | None:
@@ -272,6 +345,8 @@ class MyLinkState:
     # Wire/uORB order: front-right, front-left, rear-right, rear-left.
     top_distances_mm: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
     top_distance_age_s: float | None = None
+    ground_distance_mm: int | None = None
+    ground_distance_age_s: float | None = None
     motor_outputs_pwm_us: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
     motor_output_age_s: float | None = None
     custom_action_state: int | None = None
@@ -352,6 +427,24 @@ def decode_top_distance_mavlink(message, received_at: float | None = None) -> To
         distances_mm=distances_mm,
         received_at=time.monotonic() if received_at is None else received_at,
     )
+
+
+def decode_ground_distance_mavlink(message) -> int | None:
+    """Return downward DISTANCE_SENSOR height in millimetres."""
+    if message.get_type() != "DISTANCE_SENSOR":
+        return None
+    if int(getattr(message, "orientation", -1)) != mavlink2.MAV_SENSOR_ROTATION_PITCH_270:
+        return None
+    current_cm = int(message.current_distance)
+    minimum_cm = int(message.min_distance)
+    maximum_cm = int(message.max_distance)
+    if current_cm <= 0 or current_cm == 0xFFFF:
+        return None
+    if minimum_cm > 0 and current_cm < minimum_cm:
+        return None
+    if maximum_cm > 0 and current_cm > maximum_cm:
+        return None
+    return current_cm * 10
 
 
 def decode_motor_output_mavlink(message, received_at: float | None = None) -> MotorOutputFrame | None:
@@ -819,12 +912,14 @@ class MyLinkMavlinkClient:
         self._state = MyLinkState()
         self._last_heartbeat: float | None = None
         self._last_local_position: float | None = None
+        self._last_ground_distance: float | None = None
         self._trajectory_lock = threading.Lock()
         self._trajectory = SetpointTrajectoryGenerator()
         self._last_setpoint_time: float | None = None
         self._last_stream_mode: str | None = None
         self._offboard_yaw_ref: float | None = None
         self._setpoints_enabled = False
+        self._ground_standby = True
         self._setpoint_count = 0
         self._command_tx_count = 0
         self._heartbeat_tx_count = 0
@@ -931,6 +1026,7 @@ class MyLinkMavlinkClient:
             now = time.monotonic()
             heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
             local_age = None if self._last_local_position is None else now - self._last_local_position
+            ground_age = None if self._last_ground_distance is None else now - self._last_ground_distance
             distances, top_age = self._top_distance_snapshot(now)
             motor_outputs, motor_age = self._motor_output_snapshot(now)
             custom_status, custom_age = self._custom_status_snapshot(now)
@@ -939,6 +1035,7 @@ class MyLinkMavlinkClient:
                 connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
                 heartbeat_age_s=heartbeat_age,
                 local_position_age_s=local_age,
+                ground_distance_age_s=ground_age,
                 top_distances_mm=distances,
                 top_distance_age_s=top_age,
                 motor_outputs_pwm_us=motor_outputs,
@@ -1070,6 +1167,14 @@ class MyLinkMavlinkClient:
     def stop_setpoints(self) -> None:
         self._setpoints_enabled = False
 
+    def set_ground_standby(self, enabled: bool) -> None:
+        with self._trajectory_lock:
+            self._ground_standby = bool(enabled)
+
+    def ground_standby(self) -> bool:
+        with self._trajectory_lock:
+            return self._ground_standby
+
     def wait_setpoints(self, fresh_count: int, timeout_s: float = 5.0) -> None:
         start = self._setpoint_count
         deadline = time.monotonic() + timeout_s
@@ -1144,6 +1249,22 @@ class MyLinkMavlinkClient:
         finally:
             with self._project_lock:
                 self._outstanding_project_requests.discard(request_id)
+
+    def request_ground_distance_rate(self) -> CommandAck:
+        interval_us = round(1_000_000 / GROUND_DISTANCE_RATE_HZ)
+        return self.send_command_long(
+            mavlink2.MAV_CMD_SET_MESSAGE_INTERVAL,
+            [mavlink2.MAVLINK_MSG_ID_DISTANCE_SENSOR, interval_us, 0, 0, 0, 0, 0],
+            timeout_s=3.0,
+        )
+
+    def request_local_position_rate(self) -> CommandAck:
+        interval_us = round(1_000_000 / LOCAL_POSITION_RATE_HZ)
+        return self.send_command_long(
+            mavlink2.MAV_CMD_SET_MESSAGE_INTERVAL,
+            [mavlink2.MAVLINK_MSG_ID_LOCAL_POSITION_NED, interval_us, 0, 0, 0, 0, 0],
+            timeout_s=3.0,
+        )
 
     def block_legacy_output(self) -> None:
         self._legacy_output_allowed = False
@@ -1328,6 +1449,7 @@ class MyLinkMavlinkClient:
                 else None
             )
             generated = self._trajectory.update(actual_position, dt, actual_velocity)
+            ground_standby = self._ground_standby
             self._last_setpoint_time = now
             self._last_stream_mode = mode
 
@@ -1335,7 +1457,16 @@ class MyLinkMavlinkClient:
         vx, vy, vz = generated.command_velocity
         ax, ay, az = generated.command_acceleration
         takeoff_yaw = generated.takeoff_yaw
-        if takeoff_yaw is not None:
+        if ground_standby:
+            # Keep a fresh Offboard stream without expressing any upward intent.
+            # A finite Z target can sit a few millimetres above the estimator after
+            # landing and PX4 would then interpret re-arming as a takeoff request.
+            z = math.nan
+            vz = 0.0
+            az = math.nan
+            type_mask = POSITION_VELOCITY_MASK
+            yaw = 0.0
+        elif takeoff_yaw is not None:
             type_mask = TAKEOFF_POSITION_VELOCITY_MASK
             yaw = takeoff_yaw
         else:
@@ -1499,6 +1630,14 @@ class MyLinkMavlinkClient:
                     battery_percent=remaining,
                     battery_voltage_v=voltage,
                 )
+            elif name == "DISTANCE_SENSOR":
+                ground_distance_mm = decode_ground_distance_mavlink(message)
+                if ground_distance_mm is not None:
+                    self._last_ground_distance = now
+                    self._state = replace(
+                        self._state,
+                        ground_distance_mm=ground_distance_mm,
+                    )
             self._state_changed.notify_all()
         if name == "COMMAND_ACK":
             if (
@@ -1630,6 +1769,7 @@ class MyLinkController:
         self.client: MyLinkMavlinkClient | None = None
         self.origin: tuple[float, float, float] | None = None
         self._last_mode: str | None = None
+        self._last_armed: bool | None = None
         self._landing_requested = False
         self.busy = False
         self._lock = threading.RLock()
@@ -1667,6 +1807,30 @@ class MyLinkController:
         try:
             client.start()
             try:
+                position_rate_ack = client.request_local_position_rate()
+                if position_rate_ack.result == mavlink2.MAV_RESULT_ACCEPTED:
+                    self.log.write(
+                        f"[本地位置] 已请求{LOCAL_POSITION_RATE_HZ:g} Hz位置数据流"
+                    )
+                else:
+                    self.log.write(
+                        f"[警告] 本地位置刷新率请求未被飞控接受：结果={position_rate_ack.result}"
+                    )
+            except Exception as exc:
+                self.log.write(f"[警告] 本地位置刷新率请求失败，继续使用飞控默认频率：{exc}")
+            try:
+                distance_rate_ack = client.request_ground_distance_rate()
+                if distance_rate_ack.result == mavlink2.MAV_RESULT_ACCEPTED:
+                    self.log.write(
+                        f"[离地高度] 已请求{GROUND_DISTANCE_RATE_HZ:g} Hz测距数据流"
+                    )
+                else:
+                    self.log.write(
+                        f"[警告] 离地高度刷新率请求未被飞控接受：结果={distance_rate_ack.result}"
+                    )
+            except Exception as exc:
+                self.log.write(f"[警告] 离地高度刷新率请求失败，继续使用飞控默认频率：{exc}")
+            try:
                 save_successful_connection(client.connection_string)
                 self.log.write(f"[成功] 已保存UDP地址：{client.connection_string}")
             except (OSError, ValueError) as exc:
@@ -1678,8 +1842,10 @@ class MyLinkController:
             )
             self.origin = (float(state.x), float(state.y), float(state.z))
             self._last_mode = state.mode.upper()
+            self._last_armed = state.armed
             self._landing_requested = False
             client.reset_trajectory(self.origin, stream_mode=state.mode)
+            client.set_ground_standby(not state.armed)
             client.allow_legacy_output()
             client.start_setpoints()
             self.log.write(
@@ -1697,6 +1863,7 @@ class MyLinkController:
             client.close()
         self.origin = None
         self._last_mode = None
+        self._last_armed = None
         self._landing_requested = False
         self.log.write("[信息] PX4 UDP连接已断开")
 
@@ -1704,6 +1871,26 @@ class MyLinkController:
         if self.client is None:
             raise RuntimeError("MyLink 尚未连接")
         return self.client
+
+    @staticmethod
+    def top_mode_readiness_issue(state: MyLinkState) -> str | None:
+        if not state.connected:
+            return "飞控通信未连接或心跳超时"
+        if state.local_position_age_s is None or state.local_position_age_s > TOP_MODE_POSITION_MAX_AGE_S:
+            return "本地位置数据无效或超时"
+        if state.top_distance_age_s is None or state.top_distance_age_s > TOP_MODE_DISTANCE_MAX_AGE_S:
+            return "四路顶部激光没有数据或数据超时"
+        if any(distance is None or distance <= 0 for distance in state.top_distances_mm):
+            return "四路顶部激光数据不完整或无效"
+        if state.custom_action_age_s is None or state.custom_action_age_s > CUSTOM_STATUS_STALE_S:
+            return "飞控触顶状态通道没有数据或已经超时"
+        if state.custom_action_active or state.custom_action_owner not in (None, 0):
+            return "上一项触顶流程或控制交接尚未结束"
+        if not state.armed:
+            return "飞机尚未解锁"
+        if state.mode.upper() != "OFFBOARD":
+            return "等待进入OFFBOARD模式"
+        return None
 
     def command_result(self, label: str, result: int) -> int:
         name = mavlink2.enums["MAV_RESULT"].get(result)
@@ -1732,17 +1919,27 @@ class MyLinkController:
             return
         mode = state.mode.upper()
         previous = self._last_mode
+        previous_armed = self._last_armed
+        became_armed = previous_armed is False and state.armed
+        became_disarmed = previous_armed is True and not state.armed
         entering = previous is not None and previous != "OFFBOARD" and mode == "OFFBOARD"
         leaving = previous == "OFFBOARD" and mode != "OFFBOARD"
-        if mode != "OFFBOARD" or entering:
+        if mode != "OFFBOARD" or entering or became_armed or became_disarmed:
             if mode != "OFFBOARD":
                 self.require_client().clear_search_top_active()
             actual = (float(state.x), float(state.y), float(state.z))
             self.origin = self.origin or actual
             client = self.require_client()
             client.reset_trajectory(actual, stream_mode=mode)
+            if became_armed or became_disarmed or not state.armed:
+                client.set_ground_standby(True)
             client.allow_legacy_output()
-            if entering:
+            if became_armed:
+                self._landing_requested = False
+                self.log.write("[地面待机] 已按当前位置重新定位；等待起飞指令")
+            elif became_disarmed:
+                self.log.write("[地面待机] 已清除上一轮飞行目标，正在跟随当前位置")
+            elif entering:
                 self._landing_requested = False
                 self.log.write(
                     "[模式] 已进入OFFBOARD；最终目标和当前指令已锁定到飞机当前位置"
@@ -1750,6 +1947,7 @@ class MyLinkController:
             elif leaving:
                 self.log.write("[模式] 已退出OFFBOARD；旧目标已丢弃，开始跟随飞机当前位置")
         self._last_mode = mode
+        self._last_armed = state.armed
 
     def _require_offboard(self, action: str) -> MyLinkMavlinkClient | None:
         client = self.require_client()
@@ -1791,6 +1989,7 @@ class MyLinkController:
         actual = (float(state.x), float(state.y), float(state.z))
         old = client.trajectory().final_target
         trajectory = client.start_takeoff(actual, value)
+        client.set_ground_standby(False)
         self._log_target_change("TAKEOFF", old, trajectory.final_target)
         self.log.write(
             f"[起飞] 起始下轴位置={actual[2]:.3f} "
@@ -1887,6 +2086,11 @@ class MyLinkController:
         return False
 
     def custom(self) -> None:
+        state = self.state()
+        readiness_issue = self.top_mode_readiness_issue(state)
+        if readiness_issue is not None:
+            self.log.write(f"[已忽略] 寻顶模式：{readiness_issue}")
+            return
         client = self._require_offboard("CUSTOM1 SEARCH_TOP")
         if client is None:
             return
@@ -1900,15 +2104,19 @@ class MyLinkController:
             and ack.project_result == CUSTOM_RESULT_STARTED
         ):
             client.clear_search_top_active()
+            reason = CUSTOM_START_RESULT_ZH.get(
+                ack.project_result,
+                f"飞控返回值={ack.project_result}",
+            )
             self.log.write(
-                f"[贴顶流程] 启动失败：{MAV_RESULT_ZH.get(ack.result, '未知结果')}，"
-                f"飞控返回值={ack.project_result}"
+                f"[贴顶流程] 启动失败：{reason}（{MAV_RESULT_ZH.get(ack.result, '未知结果')}）"
             )
 
     def land(self) -> int:
         self._landing_requested = True
         client = self.require_client()
         client.clear_search_top_active()
+        client.set_ground_standby(True)
         self.log.write("[输入] 已按下一次降落按钮；后续移动目标已禁用")
         return self.command_result("LAND", client.land())
 
@@ -1924,6 +2132,7 @@ class MyLinkController:
             self.client = None
         self.origin = None
         self._last_mode = None
+        self._last_armed = None
         self._landing_requested = False
 
 
@@ -1953,12 +2162,13 @@ class OffboardControlGuiV3:
         "zh": {
             "title": "PX4 MyLink Offboard 控制台 V3.1", "connection": "MAVLink UDP 连接",
             "connect": "连接", "disconnect": "断开", "language": "语言", "state": "PX4 状态",
-            "control": "控制", "events": "事件日志", "address": "MAVLink UDP 地址",
+            "control": "控制", "events": "事件日志", "address": "MAVLink UDP 地址", "scan": "重新扫描",
             "takeoff": "起飞 TAKEOFF", "descend": "下降 DESCEND", "land": "降落 LAND", "custom": "寻顶模式",
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
             "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
             "custom_status_row": "触顶流程", "battery_row": "电池", "top_distance_row": "顶部距离",
+            "ground_distance_row": "离地高度",
             "motor_output_row": "电机PWM输出",
             "target_row": "最终目标", "command_row": "当前指令",
             "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
@@ -1969,13 +2179,14 @@ class OffboardControlGuiV3:
         "en": {
             "title": "PX4 MyLink Offboard Console V3.1", "connection": "MAVLink UDP connection",
             "connect": "CONNECT", "disconnect": "DISCONNECT", "language": "Language", "state": "PX4 STATUS",
-            "control": "CONTROL", "events": "EVENT LOG", "address": "MAVLink UDP address",
+            "control": "CONTROL", "events": "EVENT LOG", "address": "MAVLink UDP address", "scan": "RESCAN",
             "takeoff": "TAKEOFF", "descend": "DESCEND", "land": "LAND", "custom": "SEARCH TOP", "forward": "FORWARD",
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
             "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
             "custom_status_row": "Top-contact process", "battery_row": "Battery",
-            "top_distance_row": "Top distance", "motor_output_row": "Motor PWM output",
+            "top_distance_row": "Top distance", "ground_distance_row": "Height above ground",
+            "motor_output_row": "Motor PWM output",
             "target_row": "Final target", "command_row": "Command",
             "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
             "mode": "mode", "armed": "armed", "armed_yes": "True", "armed_no": "False",
@@ -1993,6 +2204,7 @@ class OffboardControlGuiV3:
         self.log = EventLog(self.events.put)
         self.controller = MyLinkController(self.log, lidar_udp_port)
         self.connection_var = tk.StringVar(value=connection)
+        self.connection_options = discover_udp_connections(connection)
         self.language_var = tk.StringVar(value="中文")
         self.altitude_var = tk.StringVar(value="1.0")
         self.distance_var = tk.StringVar(value="0.5")
@@ -2002,6 +2214,7 @@ class OffboardControlGuiV3:
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
         self.top_distance_var = tk.StringVar(value="左上 —  右上 —  左下 —  右下 — mm")
+        self.ground_distance_var = tk.StringVar(value="— mm")
         self.motor_output_vars = tuple(tk.DoubleVar(value=0.0) for _ in range(4))
         self.motor_output_text_vars = tuple(tk.StringVar(value=f"M{index + 1} —") for index in range(4))
         self.motor_output_age_var = tk.StringVar(value="age=—s")
@@ -2049,14 +2262,22 @@ class OffboardControlGuiV3:
         connection.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text=self.tr("address") + ":").grid(row=0, column=0, sticky="w")
-        ttk.Entry(connection, textvariable=self.connection_var).grid(row=0, column=1, columnspan=3, sticky="ew", padx=6)
+        self.connection_combo = ttk.Combobox(
+            connection,
+            textvariable=self.connection_var,
+            values=self.connection_options,
+            state="readonly",
+        )
+        self.connection_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6)
+        self.scan_button = ttk.Button(connection, text=self.tr("scan"), command=self._scan_connections)
+        self.scan_button.grid(row=0, column=4, padx=3)
         self.connect_button = ttk.Button(connection, text=self.tr("connect"), command=self._connect)
-        self.connect_button.grid(row=0, column=4, padx=3)
+        self.connect_button.grid(row=0, column=5, padx=3)
         self.disconnect_button = ttk.Button(connection, text=self.tr("disconnect"), command=self._disconnect)
-        self.disconnect_button.grid(row=0, column=5, padx=3)
-        ttk.Label(connection, text=self.tr("language") + ":").grid(row=0, column=6, padx=(14, 4))
+        self.disconnect_button.grid(row=0, column=6, padx=3)
+        ttk.Label(connection, text=self.tr("language") + ":").grid(row=0, column=7, padx=(14, 4))
         combo = ttk.Combobox(connection, textvariable=self.language_var, values=("中文", "English"), width=9, state="readonly")
-        combo.grid(row=0, column=7)
+        combo.grid(row=0, column=8)
         combo.bind("<<ComboboxSelected>>", self._switch_language)
 
         status = ttk.LabelFrame(root, text=self.tr("state"), padding=10)
@@ -2068,12 +2289,13 @@ class OffboardControlGuiV3:
             (self.tr("velocity_row"), self.velocity_var),
             (self.tr("battery_row"), self.battery_var),
             (self.tr("top_distance_row"), self.top_distance_var),
+            (self.tr("ground_distance_row"), self.ground_distance_var),
         )):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
-        ttk.Label(status, text=self.tr("motor_output_row") + ":", width=16).grid(row=6, column=0, sticky="nw", pady=2)
+        ttk.Label(status, text=self.tr("motor_output_row") + ":", width=16).grid(row=7, column=0, sticky="nw", pady=2)
         motor_frame = ttk.Frame(status)
-        motor_frame.grid(row=6, column=1, sticky="ew", pady=2)
+        motor_frame.grid(row=7, column=1, sticky="ew", pady=2)
         status.columnconfigure(1, weight=1)
         self.motor_progressbars: list[ttk.Progressbar] = []
         for motor_index in range(4):
@@ -2095,7 +2317,7 @@ class OffboardControlGuiV3:
         for row, (name, variable) in enumerate((
             (self.tr("target_row"), self.target_var),
             (self.tr("command_row"), self.command_var),
-        ), start=7):
+        ), start=8):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
 
@@ -2142,6 +2364,14 @@ class OffboardControlGuiV3:
     def _connect(self) -> None:
         self.controller.submit("CONNECT", lambda: self.controller.connect(self.connection_var.get().strip()))
 
+    def _scan_connections(self) -> None:
+        current = self.connection_var.get().strip()
+        self.connection_options = discover_udp_connections(current)
+        self.connection_combo.configure(values=self.connection_options)
+        if current not in self.connection_options:
+            self.connection_var.set(self.connection_options[0])
+        self.log.write(f"[网络] 扫描完成，共发现{len(self.connection_options)}个可选UDP地址")
+
     def _disconnect(self) -> None:
         self.controller.submit("DISCONNECT", self.controller.disconnect)
 
@@ -2155,6 +2385,13 @@ class OffboardControlGuiV3:
 
     def _format_custom_status(self, state: MyLinkState) -> str:
         age = state.custom_action_age_s
+
+        if state.custom_action_state in (None, 0) and not state.custom_action_active:
+            issue = self.controller.top_mode_readiness_issue(state)
+            if self.language == "zh":
+                return f"触顶准备：{issue if issue is not None else '检查通过，可以开始寻顶'}"
+            return "TOP READY" if issue is None else f"TOP NOT READY: {issue}"
+
         if state.custom_action_state is None or age is None:
             return "—"
         stale = age > CUSTOM_STATUS_STALE_S
@@ -2211,6 +2448,10 @@ class OffboardControlGuiV3:
             f"{label} {self._fmt_mm(value)}" for label, value in display_distances
         )
         self.top_distance_var.set(f"{top_values} mm | age={self._fmt(state.top_distance_age_s)}s")
+        self.ground_distance_var.set(
+            f"{self._fmt_mm(state.ground_distance_mm)} mm | "
+            f"age={self._fmt(state.ground_distance_age_s)}s"
+        )
         motor_stale = state.motor_output_age_s is None or state.motor_output_age_s > MOTOR_OUTPUT_STALE_S
         for motor_index, output in enumerate(state.motor_outputs_pwm_us):
             progress = self.motor_progressbars[motor_index]
@@ -2303,6 +2544,11 @@ def self_test() -> None:
     mavlink_frame = decode_top_distance_mavlink(mavlink_distance, received_at=2.0)
     assert mavlink_frame is not None
     assert mavlink_frame.sequence == 8 and mavlink_frame.distances_mm == (10, 20, 30, 40)
+    mavlink_ground_distance = mavlink2.MAVLink(None).distance_sensor_encode(
+        1000, 5, 400, 123, mavlink2.MAV_DISTANCE_SENSOR_LASER, 1,
+        mavlink2.MAV_SENSOR_ROTATION_PITCH_270, 0,
+    )
+    assert decode_ground_distance_mavlink(mavlink_ground_distance) == 1230
     motor_metadata = (
         MOTOR_OUTPUT_ARRAY_MARKER
         | MOTOR_OUTPUT_ARRAY_VERSION
@@ -2316,6 +2562,9 @@ def self_test() -> None:
     assert motor_frame is not None and motor_frame.armed
     assert motor_frame.sequence == 9 and motor_frame.outputs_pwm_us == (1000, 1250, 1742, 1900)
     monitor = MyLinkMavlinkClient("udp:127.0.0.1:14540")
+    assert monitor.ground_standby()
+    monitor.set_ground_standby(False)
+    assert not monitor.ground_standby()
     monitor._accept_motor_output_frame(motor_frame, "self-test")
     fresh_outputs, fresh_age = monitor._motor_output_snapshot(3.2)
     assert fresh_outputs == (1000, 1250, 1742, 1900) and math.isclose(fresh_age, 0.2)
@@ -2354,7 +2603,7 @@ def self_test() -> None:
     assert "_send_pending_top_distances" not in source
     assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
     assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
-    print("GUI V3 self-test: UDP API, distance/motor PWM/top-state monitoring, CUSTOM1 and rebase helpers OK; no connection opened")
+    print("GUI V3 self-test: UDP API, top/ground distance, motor PWM/top-state monitoring, CUSTOM1 and rebase helpers OK; no connection opened")
 
 
 def main() -> None:

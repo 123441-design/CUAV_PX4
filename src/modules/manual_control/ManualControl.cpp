@@ -92,10 +92,18 @@ void ManualControl::processInput(hrt_abstime now)
 		vehicle_status_s vehicle_status;
 
 		if (_vehicle_status_sub.copy(&vehicle_status)) {
+			_nav_state = vehicle_status.nav_state;
 			_armed = (vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED);
 			_system_id = vehicle_status.system_id;
 			_rotary_wing = (vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING);
 			_vtol = vehicle_status.is_vtol;
+
+			// A stick-triggered Offboard takeover must not reuse the same non-centered input as a
+			// Position-control movement command. Downward throttle remains available immediately.
+			if (_nav_state != vehicle_status_s::NAVIGATION_STATE_OFFBOARD
+			    && _nav_state != vehicle_status_s::NAVIGATION_STATE_POSCTL) {
+				_offboard_takeover_sticks_blocked = false;
+			}
 		}
 	}
 
@@ -153,7 +161,40 @@ void ManualControl::processInput(hrt_abstime now)
 			     && _throttle_diff.consecutiveSameSign() >= MIN_SIGN_CONSECUTIVE));
 
 		_selector.setpoint().timestamp = now;
-		_manual_control_setpoint_pub.publish(_selector.setpoint());
+
+		// Preserve the takeover flag for Commander, but block the triggering stick values before
+		// Position control can consume them on the Offboard-to-Position transition.
+		if (_nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD
+		    && _selector.setpoint().sticks_moving) {
+			_offboard_takeover_sticks_blocked = true;
+		}
+
+		manual_control_setpoint_s published_setpoint = _selector.setpoint();
+
+		if (_offboard_takeover_sticks_blocked) {
+			const float deadzone = _param_man_deadzone.get();
+			const bool sticks_centered = fabsf(published_setpoint.roll) <= deadzone
+						    && fabsf(published_setpoint.pitch) <= deadzone
+						    && fabsf(published_setpoint.yaw) <= deadzone
+						    && fabsf(published_setpoint.throttle) <= deadzone;
+
+			if (sticks_centered) {
+				_offboard_takeover_sticks_blocked = false;
+
+			} else {
+				published_setpoint.roll = 0.f;
+				published_setpoint.pitch = 0.f;
+				published_setpoint.yaw = 0.f;
+
+				// Only downward throttle bypasses the recenter gate. Neutral and upward
+				// throttle hold the takeover altitude until all sticks have been centered.
+				if (published_setpoint.throttle >= -deadzone) {
+					published_setpoint.throttle = 0.f;
+				}
+			}
+		}
+
+		_manual_control_setpoint_pub.publish(published_setpoint);
 
 		// Attach scheduling to new samples of the chosen input
 		const int instance = _selector.instance();

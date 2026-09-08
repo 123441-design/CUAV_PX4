@@ -55,6 +55,7 @@ private:
 	bool localStateValid() const;
 	bool sensorFresh(hrt_abstime now) const;
 	float minimumTopDistance() const;
+	uint8_t topDistanceCountAtOrBelow(float threshold) const;
 	void updateFilteredTopDistance();
 	bool isPrecontactState() const;
 	float activeClimbVelocity() const;
@@ -105,6 +106,7 @@ private:
 
 	DEFINE_PARAMETERS(
 		(ParamBool<px4::params::CUST_TOP_EN>) _param_enabled,
+		(ParamBool<px4::params::CUST_CLOSE_EN>) _param_close_start_enabled,
 		(ParamFloat<px4::params::CUST_TOP_VEL>) _param_top_velocity,
 		(ParamFloat<px4::params::CUST_TOP_DIST>) _param_top_distance,
 		(ParamFloat<px4::params::CUST_TOP_TIME>) _param_top_time,

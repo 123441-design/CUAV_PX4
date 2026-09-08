@@ -8,6 +8,12 @@ parameters:
         type: boolean
         default: 1
         reboot_required: true
+      CUST_CLOSE_EN:
+        description:
+          short: Allow close-range SEARCH_TOP start
+          long: Test-only override. When disabled, SEARCH_TOP can start only when all four upward distances are greater than CUST_TOP_GAP plus CUST_TOP_HYST. Enabling this bypasses only the initial distance gate; all other sensor and contact checks remain active.
+        type: boolean
+        default: 0
       CUST_TOP_VEL:
         description:
           short: SEARCH_TOP upward speed
