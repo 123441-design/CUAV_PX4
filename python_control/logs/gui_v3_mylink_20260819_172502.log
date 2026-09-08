@@ -1,2 +1,0 @@
-17:29:48 [ERROR] CONNECT: 等待 MyLink HEARTBEAT 超时；当前状态=MyLinkState(connected=False, system_id=0, component_id=0, armed=False, mode='DISCONNECTED', x=None, y=None, z=None, vx=None, vy=None, vz=None, roll=None, pitch=None, yaw=None, battery_percent=None, battery_voltage_v=None, heartbeat_age_s=None, local_position_age_s=None, rx_counts=(), tx_setpoints=0, error='')
-17:29:52 [INFO] GUI V3 closed

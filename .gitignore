@@ -6,3 +6,5 @@ mavlink_cache/
 *.px4
 __pycache__/
 *.pyc
+/dataman
+/python_control/logs/*.log
