@@ -60,7 +60,7 @@ public:
 
 	unsigned get_size() override
 	{
-		return 3 * (MAVLINK_MSG_ID_PING_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES);
+		return 4 * (MAVLINK_MSG_ID_PING_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES);
 	}
 
 	bool const_rate() override { return true; }
@@ -78,6 +78,7 @@ private:
 #endif
 	uint16_t _motor_sequence{0};
 	uint16_t _custom_status_sequence{0};
+	uint16_t _pressure_detail_sequence{0};
 	uint8_t _standard_ping_divider{0};
 
 	bool send() override
@@ -154,7 +155,48 @@ private:
 			      | (static_cast<uint32_t>(++_custom_status_sequence)
 				 & custom_action_protocol::kCustomStatusSequenceMask);
 		send_to_upper_computer(message);
+		send_pressure_detail(status);
 		return true;
+	}
+
+	void send_pressure_detail(const custom_action_status_s &status)
+	{
+		const uint16_t target_gain = static_cast<uint16_t>(math::constrain(
+					     status.pressure_target_gain * custom_action_protocol::kPressureDetailGainScale,
+					     0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+		const uint16_t applied_gain = static_cast<uint16_t>(math::constrain(
+					      status.pressure_applied_gain * custom_action_protocol::kPressureDetailGainScale,
+					      0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+		const uint16_t progress = static_cast<uint16_t>(math::constrain(
+					  status.pressure_progress * custom_action_protocol::kPressureDetailProgressScale,
+					  0.f, custom_action_protocol::kPressureDetailProgressScale) + 0.5f);
+		const uint16_t pressure_time_ms = static_cast<uint16_t>(math::constrain(
+						 status.pressure_time_s * custom_action_protocol::kPressureDetailTimeScale,
+						 0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+		const uint64_t packed_pressure = static_cast<uint64_t>(target_gain)
+						 | (static_cast<uint64_t>(applied_gain) << custom_action_protocol::kPressureDetailValueBits)
+						 | (static_cast<uint64_t>(progress) << (2 * custom_action_protocol::kPressureDetailValueBits))
+						 | (static_cast<uint64_t>(pressure_time_ms) << (3 * custom_action_protocol::kPressureDetailValueBits));
+
+		mavlink_ping_t message{};
+		message.time_usec = packed_pressure;
+		message.seq = custom_action_protocol::kPressureDetailMarker
+			      | custom_action_protocol::kPressureDetailVersion
+			      | ((static_cast<uint32_t>(status.trim_source)
+				  << custom_action_protocol::kPressureDetailTrimSourceShift)
+				 & custom_action_protocol::kPressureDetailTrimSourceMask)
+			      | ((static_cast<uint32_t>(status.trim_candidate_mask)
+				  << custom_action_protocol::kPressureDetailCandidateShift)
+				 & custom_action_protocol::kPressureDetailCandidateMask)
+			      | ((static_cast<uint32_t>(status.limiting_motor)
+				  << custom_action_protocol::kPressureDetailLimitingMotorShift)
+				 & custom_action_protocol::kPressureDetailLimitingMotorMask)
+			      | (status.pressure_limited ? custom_action_protocol::kPressureDetailLimitedFlag : 0u)
+			      | (status.pressure_ramp_complete ? custom_action_protocol::kPressureDetailCompleteFlag : 0u)
+			      | custom_action_protocol::kPressureDetailValidFlag
+			      | (static_cast<uint32_t>(++_pressure_detail_sequence)
+				 & custom_action_protocol::kPressureDetailSequenceMask);
+		send_to_upper_computer(message);
 	}
 
 	bool send_motor_outputs()

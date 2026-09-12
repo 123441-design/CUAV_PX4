@@ -140,6 +140,7 @@ private:
 	void sendVehicleCommandAck(const vehicle_command_ack_s &ack);
 	void relayTopDistance();
 	void relayMotorOutputs();
+	void relayCustomActionStatus();
 
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
@@ -184,6 +185,7 @@ private:
 	uint32_t _relayed_command_acks{0};
 	uint32_t _relayed_top_distance_frames{0};
 	uint32_t _relayed_motor_output_frames{0};
+	uint32_t _relayed_custom_status_frames{0};
 	uint32_t _invalid_setpoints{0};
 	uint32_t _motor_test_commands{0};
 	uint32_t _invalid_motor_test_commands{0};
@@ -204,7 +206,10 @@ private:
 	hrt_abstime _last_setpoint_rx{0};
 	hrt_abstime _last_top_distance_tx{0};
 	hrt_abstime _last_motor_output_tx{0};
+	hrt_abstime _last_custom_status_timestamp{0};
 	uint16_t _motor_output_sequence{0};
+	uint16_t _custom_status_sequence{0};
+	uint16_t _pressure_detail_sequence{0};
 	bool _was_armed{false};
 	bool _commander_owns_control{false};
 	custom_action_status_s _custom_action_status{};

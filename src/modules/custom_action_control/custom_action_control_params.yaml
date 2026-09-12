@@ -116,24 +116,83 @@ parameters:
         max: 0.030
         default: 0.005
         decimal: 3
-      CUST_PRS_ADD:
+      CUST_TRIM_RATIO:
         description:
-          short: Contact thrust offset
-          long: Normalized thrust added above hover after stable contact. Attitude and yaw control remain active, while horizontal position control is released so thrust stays normal to a horizontal ceiling.
+          short: Motor trim capture time ratio
+          long: Fraction of each stage's estimated available travel time used to collect motor trim samples. The result is constrained by CUST_TRIM_TMIN and CUST_TRIM_TMAX.
+        type: float
+        min: 0.01
+        max: 1.00
+        default: 0.20
+        decimal: 2
+      CUST_TRIM_TMIN:
+        description:
+          short: Minimum motor trim capture time
+          long: Lower bound for the dynamically calculated motor trim capture time.
+        type: float
+        unit: s
+        min: 0.05
+        max: 2.00
+        default: 0.25
+        decimal: 2
+      CUST_TRIM_TMAX:
+        description:
+          short: Maximum motor trim capture time
+          long: Upper bound for the dynamically calculated motor trim capture time and the bounded wait before a safe downward retreat.
+        type: float
+        unit: s
+        min: 0.10
+        max: 3.00
+        default: 0.80
+        decimal: 2
+      CUST_TRIM_ANG:
+        description:
+          short: Motor trim attitude limit
+          long: Maximum absolute roll or pitch angle allowed while collecting per-motor trim samples.
+        type: float
+        unit: deg
+        min: 1.0
+        max: 15.0
+        default: 3.0
+        decimal: 1
+      CUST_TRIM_RATE:
+        description:
+          short: Motor trim rate limit
+          long: Maximum absolute roll or pitch angular rate allowed while collecting per-motor trim samples.
+        type: float
+        unit: deg/s
+        min: 2.0
+        max: 45.0
+        default: 10.0
+        decimal: 1
+      CUST_PRS_GAIN:
+        description:
+          short: Pressure gain from contact output
+          long: Each motor increases from its selected filtered trim by this common ratio. A value of 0.10 commands 1.10 times the aligned filtered baseline, subject to CUST_MOT_LIM. Individual motor outputs are not redistributed.
         type: float
         min: 0.00
-        max: 0.15
-        default: 0.05
+        max: 0.50
+        default: 0.30
         decimal: 3
-      CUST_PRS_RAMP:
+      CUST_PRS_TIME:
         description:
-          short: Contact thrust ramp rate
+          short: Contact pressure ramp time
+          long: Time used to increase monotonically from the aligned filtered motor baseline to CUST_PRS_GAIN after the bounded direct-control blend. Reaching this time does not guarantee the target gain if CUST_MOT_LIM becomes active.
         type: float
-        unit: 1/s
-        min: 0.005
-        max: 0.20
-        default: 0.05
-        decimal: 3
+        unit: s
+        min: 0.20
+        max: 10.00
+        default: 3.00
+        decimal: 2
+      CUST_MOT_LIM:
+        description:
+          short: Direct motor output limit
+          long: Common scaling stops when any filtered-baseline motor would exceed this normalized output, preserving the selected filtered motor ratios.
+        type: float
+        min: 0.50
+        max: 1.00
+        default: 0.95
+        decimal: 2
       CUST_SENS_TO:
         description:
           short: Top-distance data timeout

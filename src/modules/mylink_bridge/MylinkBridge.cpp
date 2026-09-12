@@ -411,6 +411,90 @@ void MylinkBridge::relayMotorOutputs()
 	_relayed_motor_output_frames++;
 }
 
+void MylinkBridge::relayCustomActionStatus()
+{
+	if (_remote_system == 0 || _remote_component == 0) {
+		return;
+	}
+
+#if defined(__PX4_POSIX)
+	if (_udp_port > 0 && !_udp_peer_valid) {
+		return;
+	}
+#endif
+
+	custom_action_status_s status{};
+
+	if (!_custom_action_status_sub.copy(&status) || status.timestamp == 0
+	    || status.timestamp == _last_custom_status_timestamp) {
+		return;
+	}
+
+	vehicle_status_s vehicle_status{};
+	_vehicle_status_sub.copy(&vehicle_status);
+	const uint8_t system_id = vehicle_status.system_id > 0 ? vehicle_status.system_id : 1;
+	mavlink_message_t state_message{};
+	const uint32_t state_metadata = custom_action_protocol::kCustomStatusMarker
+					| custom_action_protocol::kCustomStatusVersion
+					| ((static_cast<uint32_t>(status.state)
+					    << custom_action_protocol::kCustomStatusStateShift)
+					   & custom_action_protocol::kCustomStatusStateMask)
+					| ((static_cast<uint32_t>(status.control_owner)
+					    << custom_action_protocol::kCustomStatusOwnerShift)
+					   & custom_action_protocol::kCustomStatusOwnerMask)
+					| (status.active ? custom_action_protocol::kCustomStatusActiveFlag : 0u)
+					| ((static_cast<uint32_t>(status.reason)
+					    << custom_action_protocol::kCustomStatusReasonShift)
+					   & custom_action_protocol::kCustomStatusReasonMask)
+					| (static_cast<uint32_t>(++_custom_status_sequence)
+					   & custom_action_protocol::kCustomStatusSequenceMask);
+	mavlink_msg_ping_pack_status(system_id, custom_action_protocol::kComponentId,
+				     &_tx_status, &state_message, status.handover_id, state_metadata,
+				     _remote_system, static_cast<uint8_t>(_remote_component));
+	sendMavlinkMessage(state_message);
+
+	const uint16_t target_gain = static_cast<uint16_t>(math::constrain(
+				     status.pressure_target_gain * custom_action_protocol::kPressureDetailGainScale,
+				     0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+	const uint16_t applied_gain = static_cast<uint16_t>(math::constrain(
+				      status.pressure_applied_gain * custom_action_protocol::kPressureDetailGainScale,
+				      0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+	const uint16_t progress = static_cast<uint16_t>(math::constrain(
+				  status.pressure_progress * custom_action_protocol::kPressureDetailProgressScale,
+				  0.f, custom_action_protocol::kPressureDetailProgressScale) + 0.5f);
+	const uint16_t pressure_time_ms = static_cast<uint16_t>(math::constrain(
+					 status.pressure_time_s * custom_action_protocol::kPressureDetailTimeScale,
+					 0.f, static_cast<float>(UINT16_MAX)) + 0.5f);
+	const uint64_t packed_pressure = static_cast<uint64_t>(target_gain)
+					 | (static_cast<uint64_t>(applied_gain) << custom_action_protocol::kPressureDetailValueBits)
+					 | (static_cast<uint64_t>(progress) << (2 * custom_action_protocol::kPressureDetailValueBits))
+					 | (static_cast<uint64_t>(pressure_time_ms) << (3 * custom_action_protocol::kPressureDetailValueBits));
+	const uint32_t pressure_metadata = custom_action_protocol::kPressureDetailMarker
+					   | custom_action_protocol::kPressureDetailVersion
+					   | ((static_cast<uint32_t>(status.trim_source)
+					       << custom_action_protocol::kPressureDetailTrimSourceShift)
+					      & custom_action_protocol::kPressureDetailTrimSourceMask)
+					   | ((static_cast<uint32_t>(status.trim_candidate_mask)
+					       << custom_action_protocol::kPressureDetailCandidateShift)
+					      & custom_action_protocol::kPressureDetailCandidateMask)
+					   | ((static_cast<uint32_t>(status.limiting_motor)
+					       << custom_action_protocol::kPressureDetailLimitingMotorShift)
+					      & custom_action_protocol::kPressureDetailLimitingMotorMask)
+					   | (status.pressure_limited ? custom_action_protocol::kPressureDetailLimitedFlag : 0u)
+					   | (status.pressure_ramp_complete ? custom_action_protocol::kPressureDetailCompleteFlag : 0u)
+					   | custom_action_protocol::kPressureDetailValidFlag
+					   | (static_cast<uint32_t>(++_pressure_detail_sequence)
+					      & custom_action_protocol::kPressureDetailSequenceMask);
+	mavlink_message_t pressure_message{};
+	mavlink_msg_ping_pack_status(system_id, custom_action_protocol::kComponentId,
+				     &_tx_status, &pressure_message, packed_pressure, pressure_metadata,
+				     _remote_system, static_cast<uint8_t>(_remote_component));
+	sendMavlinkMessage(pressure_message);
+
+	_last_custom_status_timestamp = status.timestamp;
+	_relayed_custom_status_frames += 2;
+}
+
 void MylinkBridge::handlePing(const mavlink_message_t &message)
 {
 	mavlink_ping_t ping{};
@@ -1096,6 +1180,7 @@ void MylinkBridge::Run()
 		relayVehicleCommandAcks();
 		relayTopDistance();
 		relayMotorOutputs();
+		relayCustomActionStatus();
 		readUdp();
 		perf_end(_loop_perf);
 		return;
@@ -1119,6 +1204,7 @@ void MylinkBridge::Run()
 	relayVehicleCommandAcks();
 	relayTopDistance();
 	relayMotorOutputs();
+	relayCustomActionStatus();
 	readSerial();
 	perf_end(_loop_perf);
 }
@@ -1240,6 +1326,10 @@ int MylinkBridge::print_status()
 		 _relayed_motor_output_frames,
 		 _last_motor_output_tx > 0 && hrt_absolute_time() >= _last_motor_output_tx
 		 ? (hrt_absolute_time() - _last_motor_output_tx) / 1000 : 0);
+	PX4_INFO("custom_status: relayed_frames=%" PRIu32 " rate_limit=5Hz last_tx_age_ms=%" PRIu64,
+		 _relayed_custom_status_frames,
+		 _last_custom_status_timestamp > 0 && hrt_absolute_time() >= _last_custom_status_timestamp
+		 ? (hrt_absolute_time() - _last_custom_status_timestamp) / 1000 : 0);
 	PX4_INFO("events: takeoff=%u land=%u speed=%u pause=%u continue=%u rtl=%u mission_start=%u",
 		 (_event_flags & EventTakeoff) != 0, (_event_flags & EventLand) != 0,
 		 (_event_flags & EventSpeed) != 0, (_event_flags & EventPause) != 0,

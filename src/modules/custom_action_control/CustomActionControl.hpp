@@ -11,14 +11,20 @@
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
 
+#include <matrix/matrix/math.hpp>
+
 #include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
+#include <uORB/topics/actuator_motors.h>
 #include <uORB/topics/custom_action_status.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/top_distance.h>
 #include <uORB/topics/trajectory_setpoint.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
+#include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
+#include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
 
@@ -38,6 +44,24 @@ public:
 	static int publishTestCommand(int action, int value, int request_id);
 
 private:
+	enum class MotorTrimSource : uint8_t {
+		None = 0,
+		SearchLoose,
+		SearchStrict,
+		ApproachStrict
+	};
+
+	struct MotorTrimCandidate {
+		float filtered[actuator_motors_s::NUM_CONTROLS] {};
+		uint16_t mask{0};
+		float valid_time_s{0.f};
+		hrt_abstime last_update{0};
+		hrt_abstime invalid_since{0};
+		bool initialized{false};
+		bool previous_sample_valid{false};
+		bool valid{false};
+	};
+
 	void Run() override;
 	void handleCommand(const vehicle_command_s &command);
 	void startSearchTop(const vehicle_command_s &command, uint16_t request_id);
@@ -45,6 +69,7 @@ private:
 	void handleRebaseComplete(const vehicle_command_s &command, uint16_t request_id);
 	void enterTopApproach();
 	void enterContactVerify(hrt_abstime now);
+	void enterMotorTrimWait(hrt_abstime now);
 	void enterContactPress(hrt_abstime now);
 	void beginHandover(uint8_t reason, uint16_t handover_id, uint8_t target_system,
 			   uint16_t target_component, bool notify_pending);
@@ -58,7 +83,25 @@ private:
 	uint8_t topDistanceCountAtOrBelow(float threshold) const;
 	void updateFilteredTopDistance();
 	bool isPrecontactState() const;
-	float activeClimbVelocity() const;
+	float verticalVelocityNed() const;
+	float trimHoldDistance() const;
+	float constrainedTrimTime(float available_time_s) const;
+	void resetMotorTrim();
+	void resetMotorTrimCandidate(MotorTrimCandidate &candidate);
+	void updateMotorTrim(hrt_abstime now, bool actuator_updated);
+	void updateMotorTrimCandidate(MotorTrimCandidate &candidate, hrt_abstime now, bool loose,
+				      float required_time_s, const char *name);
+	bool motorTrimSampleValid(hrt_abstime now, bool loose, uint16_t &sample_mask) const;
+	bool anyMotorTrimCandidateValid() const;
+	void selectBestMotorTrim();
+	bool updateMotorTrimSafety(hrt_abstime now);
+	const char *motorTrimSourceName(MotorTrimSource source) const;
+	bool motorTrimWaitSampleStable(hrt_abstime now) const;
+	void updateMotorTrimWhileWaiting(hrt_abstime now);
+	bool motorTrimMatchesCurrent(hrt_abstime now) const;
+	bool directActuatorReady(hrt_abstime now) const;
+	bool preparePressHandover(hrt_abstime now);
+	void publishDirectMotorSetpoint(hrt_abstime now);
 	void publishControlSetpoint(hrt_abstime now);
 	void publishStatus(bool force = false);
 	void publishAck(const vehicle_command_s &command, uint8_t result, uint8_t project_result);
@@ -68,8 +111,13 @@ private:
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
+	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
+	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+	uORB::Subscription _actuator_motors_sub{ORB_ID(actuator_motors)};
 	uORB::Subscription _top_distance_sub{ORB_ID(top_distance)};
 
+	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<custom_action_status_s> _status_pub{ORB_ID(custom_action_status)};
 	uORB::Publication<offboard_control_mode_s> _offboard_control_mode_pub{ORB_ID(offboard_control_mode)};
 	uORB::Publication<trajectory_setpoint_s> _trajectory_setpoint_pub{ORB_ID(trajectory_setpoint)};
@@ -77,6 +125,10 @@ private:
 
 	vehicle_local_position_s _local_position{};
 	vehicle_status_s _vehicle_status{};
+	vehicle_control_mode_s _vehicle_control_mode{};
+	vehicle_attitude_s _vehicle_attitude{};
+	vehicle_angular_velocity_s _vehicle_angular_velocity{};
+	actuator_motors_s _allocated_motors{};
 	top_distance_s _top_distance{};
 
 	uint8_t _state{custom_action_status_s::STATE_INACTIVE};
@@ -95,12 +147,37 @@ private:
 	float _filtered_top_distance{NAN};
 	float _verify_min_distance{NAN};
 	float _verify_max_distance{NAN};
+	float _motor_trim[actuator_motors_s::NUM_CONTROLS] {};
+	float _press_entry_output[actuator_motors_s::NUM_CONTROLS] {};
+	float _press_base_output[actuator_motors_s::NUM_CONTROLS] {};
+	MotorTrimCandidate _search_loose_trim{};
+	MotorTrimCandidate _search_strict_trim{};
+	MotorTrimCandidate _approach_strict_trim{};
+	MotorTrimSource _motor_trim_source{MotorTrimSource::None};
+	uint16_t _motor_trim_mask{0};
+	uint16_t _press_output_mask{0};
+	bool _motor_trim_valid{false};
+	bool _motor_output_limited{false};
+	bool _pressure_ramp_complete{false};
+	bool _trim_retreat_active{false};
+	float _active_pressure_gain{0.f};
+	uint8_t _limiting_motor{0};
+	float _search_trim_required_s{0.f};
+	float _approach_trim_required_s{0.f};
+	float _trim_retreat_start_z{0.f};
 	uint8_t _contact_threshold_frames{0};
 	uint8_t _heading_reset_counter{0};
 	hrt_abstime _search_started{0};
 	uint16_t _last_top_distance_sequence{0};
 	hrt_abstime _verify_started{0};
+	hrt_abstime _motor_trim_match_started{0};
+	hrt_abstime _motor_trim_match_stable_started{0};
+	hrt_abstime _motor_trim_wait_last_update{0};
 	hrt_abstime _press_started{0};
+	hrt_abstime _press_output_started{0};
+	hrt_abstime _pressure_ramp_started{0};
+	hrt_abstime _trim_hold_started{0};
+	hrt_abstime _trim_retreat_started{0};
 	hrt_abstime _handover_started{0};
 	hrt_abstime _last_status_publish{0};
 
@@ -118,10 +195,15 @@ private:
 		(ParamFloat<px4::params::CUST_CNT_DIST>) _param_contact_distance,
 		(ParamFloat<px4::params::CUST_CNT_TIME>) _param_contact_time,
 		(ParamFloat<px4::params::CUST_STAB_BND>) _param_stability_band,
-		(ParamFloat<px4::params::CUST_PRS_ADD>) _param_press_add,
-		(ParamFloat<px4::params::CUST_PRS_RAMP>) _param_press_ramp,
+		(ParamFloat<px4::params::CUST_TRIM_RATIO>) _param_trim_ratio,
+		(ParamFloat<px4::params::CUST_TRIM_TMIN>) _param_trim_time_min,
+		(ParamFloat<px4::params::CUST_TRIM_TMAX>) _param_trim_time_max,
+		(ParamFloat<px4::params::CUST_TRIM_ANG>) _param_trim_angle,
+		(ParamFloat<px4::params::CUST_TRIM_RATE>) _param_trim_rate,
+		(ParamFloat<px4::params::CUST_PRS_GAIN>) _param_press_gain,
+		(ParamFloat<px4::params::CUST_PRS_TIME>) _param_press_time,
+		(ParamFloat<px4::params::CUST_MOT_LIM>) _param_motor_limit,
 		(ParamFloat<px4::params::CUST_SENS_TO>) _param_sensor_timeout,
-		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout,
-		(ParamFloat<px4::params::MPC_THR_HOVER>) _param_hover_thrust
+		(ParamFloat<px4::params::CUST_HO_TIME>) _param_handover_timeout
 	)
 };

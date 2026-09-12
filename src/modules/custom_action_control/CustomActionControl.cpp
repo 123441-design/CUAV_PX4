@@ -22,7 +22,22 @@ namespace
 {
 constexpr hrt_abstime kRunInterval = 20_ms;
 constexpr hrt_abstime kLocalPositionTimeout = 500_ms;
-constexpr hrt_abstime kStatusInterval = 500_ms;
+constexpr hrt_abstime kAttitudeTimeout = 200_ms;
+constexpr hrt_abstime kActuatorTimeout = 200_ms;
+constexpr hrt_abstime kControlModeTimeout = 1_s;
+constexpr hrt_abstime kDirectActuatorTakeoverTimeout = 1_s;
+constexpr hrt_abstime kStatusInterval = 200_ms;
+constexpr hrt_abstime kTrimInvalidResetDelay = 250_ms;
+constexpr hrt_abstime kTrimRetreatTimeout = 3_s;
+constexpr hrt_abstime kMotorTrimMatchStableTime = 250_ms;
+constexpr hrt_abstime kMotorTrimMatchTimeout = 1_s;
+constexpr hrt_abstime kPressMotorBlendTime = 300_ms;
+constexpr float kMotorTrimFilterTimeConstant = 0.4f;
+constexpr float kTrimLooseLimitMultiplier = 2.f;
+constexpr float kTrimRetreatDistance = 0.15f;
+constexpr float kMotorTrimMatchRelativeTolerance = 0.10f;
+constexpr float kMotorTrimMatchAbsoluteFloor = 0.015f;
+constexpr uint8_t kMinimumMotorCount = 4;
 constexpr uint8_t kContactThresholdFramesRequired = 3;
 constexpr uint8_t kContactSensorCountRequired = 3;
 const char *reasonName(uint8_t reason)
@@ -36,6 +51,8 @@ const char *reasonName(uint8_t reason)
 	case custom_action_status_s::REASON_HEADING_RESET: return "heading reset";
 	case custom_action_status_s::REASON_LAND: return "land";
 	case custom_action_status_s::REASON_TOP_DISTANCE: return "top distance";
+	case custom_action_status_s::REASON_ACTUATOR_TIMEOUT: return "direct actuator timeout";
+	case custom_action_status_s::REASON_MOTOR_TRIM_MISMATCH: return "motor trim mismatch";
 	default: return "none";
 	}
 }
@@ -143,20 +160,607 @@ bool CustomActionControl::isPrecontactState() const
 {
 	return _state == custom_action_status_s::STATE_SEARCH_TOP
 	       || _state == custom_action_status_s::STATE_TOP_APPROACH
-	       || _state == custom_action_status_s::STATE_CONTACT_VERIFY;
+	       || _state == custom_action_status_s::STATE_CONTACT_VERIFY
+	       || _state == custom_action_status_s::STATE_MOTOR_TRIM_WAIT;
 }
 
-float CustomActionControl::activeClimbVelocity() const
+float CustomActionControl::verticalVelocityNed() const
 {
 	if (_state == custom_action_status_s::STATE_TOP_APPROACH) {
-		return _param_approach_velocity.get();
+		if (_trim_retreat_active) {
+			return math::constrain(2.f * _param_approach_velocity.get(), 0.05f, 0.15f);
+		}
+
+		// Stop at a dynamically sized guard distance while the three capture
+		// candidates are still unavailable. The wait is bounded in
+		// updateMotorTrimSafety(), so this cannot become a long hover near the roof.
+		if (!anyMotorTrimCandidateValid() && minimumTopDistance() <= trimHoldDistance()) {
+			return 0.f;
+		}
+
+		return -_param_approach_velocity.get();
 	}
 
 	if (_state == custom_action_status_s::STATE_CONTACT_VERIFY) {
-		return _param_verify_velocity.get();
+		return -_param_verify_velocity.get();
 	}
 
-	return _param_top_velocity.get();
+	if (_state == custom_action_status_s::STATE_MOTOR_TRIM_WAIT) {
+		return 0.f;
+	}
+
+	return -_param_top_velocity.get();
+}
+
+float CustomActionControl::trimHoldDistance() const
+{
+	const float maximum_capture_time = math::max(_param_trim_time_max.get(), _param_trim_time_min.get());
+	const float capture_distance = _param_approach_velocity.get() * maximum_capture_time;
+	return _param_contact_distance.get() + math::max(_param_top_hysteresis.get(), capture_distance);
+}
+
+float CustomActionControl::constrainedTrimTime(float available_time_s) const
+{
+	const float minimum_time = math::max(_param_trim_time_min.get(), 0.05f);
+	const float maximum_time = math::max(_param_trim_time_max.get(), minimum_time);
+	const float ratio = math::constrain(_param_trim_ratio.get(), 0.01f, 1.f);
+	return math::constrain(math::max(available_time_s, 0.f) * ratio, minimum_time, maximum_time);
+}
+
+void CustomActionControl::resetMotorTrimCandidate(MotorTrimCandidate &candidate)
+{
+	candidate = MotorTrimCandidate{};
+}
+
+void CustomActionControl::resetMotorTrim()
+{
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		_motor_trim[i] = 0.f;
+		_press_entry_output[i] = 0.f;
+		_press_base_output[i] = 0.f;
+	}
+
+	resetMotorTrimCandidate(_search_loose_trim);
+	resetMotorTrimCandidate(_search_strict_trim);
+	resetMotorTrimCandidate(_approach_strict_trim);
+	_motor_trim_source = MotorTrimSource::None;
+	_motor_trim_mask = 0;
+	_press_output_mask = 0;
+	_motor_trim_valid = false;
+	_motor_output_limited = false;
+	_pressure_ramp_complete = false;
+	_trim_retreat_active = false;
+	_active_pressure_gain = 0.f;
+	_limiting_motor = 0;
+	_search_trim_required_s = 0.f;
+	_approach_trim_required_s = 0.f;
+	_trim_retreat_start_z = 0.f;
+	_press_output_started = 0;
+	_pressure_ramp_started = 0;
+	_motor_trim_match_started = 0;
+	_motor_trim_match_stable_started = 0;
+	_motor_trim_wait_last_update = 0;
+	_trim_hold_started = 0;
+	_trim_retreat_started = 0;
+}
+
+bool CustomActionControl::motorTrimSampleValid(hrt_abstime now, bool loose, uint16_t &sample_mask) const
+{
+	sample_mask = 0;
+
+	if (!sensorFresh(now)
+	    || minimumTopDistance() <= _param_contact_distance.get()
+	    || _vehicle_attitude.timestamp == 0 || now < _vehicle_attitude.timestamp
+	    || now - _vehicle_attitude.timestamp > kAttitudeTimeout
+	    || _vehicle_angular_velocity.timestamp == 0 || now < _vehicle_angular_velocity.timestamp
+	    || now - _vehicle_angular_velocity.timestamp > kAttitudeTimeout
+	    || _allocated_motors.timestamp == 0 || now < _allocated_motors.timestamp
+	    || now - _allocated_motors.timestamp > kActuatorTimeout) {
+		return false;
+	}
+
+	const matrix::Eulerf attitude{matrix::Quatf{_vehicle_attitude.q}};
+	const float limit_multiplier = loose ? kTrimLooseLimitMultiplier : 1.f;
+	const float angle_limit = math::radians(_param_trim_angle.get() * limit_multiplier);
+	const float rate_limit = math::radians(_param_trim_rate.get() * limit_multiplier);
+
+	if (!PX4_ISFINITE(attitude.phi()) || !PX4_ISFINITE(attitude.theta())
+	    || fabsf(attitude.phi()) > angle_limit || fabsf(attitude.theta()) > angle_limit
+	    || !PX4_ISFINITE(_vehicle_angular_velocity.xyz[0])
+	    || !PX4_ISFINITE(_vehicle_angular_velocity.xyz[1])
+	    || fabsf(_vehicle_angular_velocity.xyz[0]) > rate_limit
+	    || fabsf(_vehicle_angular_velocity.xyz[1]) > rate_limit) {
+		return false;
+	}
+
+	uint8_t motor_count = 0;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		const float control = _allocated_motors.control[i];
+
+		if (PX4_ISFINITE(control)) {
+			if (control < 0.f || control > _param_motor_limit.get()) {
+				return false;
+			}
+
+			sample_mask |= static_cast<uint16_t>(1u << i);
+			++motor_count;
+		}
+	}
+
+	return motor_count >= kMinimumMotorCount;
+}
+
+void CustomActionControl::updateMotorTrimCandidate(MotorTrimCandidate &candidate, hrt_abstime now, bool loose,
+		float required_time_s, const char *name)
+{
+	uint16_t sample_mask = 0;
+
+	if (!motorTrimSampleValid(now, loose, sample_mask)) {
+		if (!candidate.valid) {
+			if (candidate.invalid_since == 0) {
+				candidate.invalid_since = now;
+			}
+
+			candidate.previous_sample_valid = false;
+			candidate.last_update = now;
+
+			if (candidate.initialized && now >= candidate.invalid_since
+			    && now - candidate.invalid_since >= kTrimInvalidResetDelay) {
+				resetMotorTrimCandidate(candidate);
+			}
+		}
+
+		return;
+	}
+
+	if (!candidate.initialized || sample_mask != candidate.mask) {
+		resetMotorTrimCandidate(candidate);
+		candidate.mask = sample_mask;
+
+		for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+			if (sample_mask & (1u << i)) {
+				candidate.filtered[i] = _allocated_motors.control[i];
+			}
+		}
+
+		candidate.initialized = true;
+		candidate.previous_sample_valid = true;
+		candidate.last_update = now;
+		return;
+	}
+
+	const float dt = now >= candidate.last_update
+			 ? math::constrain(static_cast<float>(now - candidate.last_update) * 1e-6f, 0.001f, 0.1f)
+			 : 0.001f;
+	const float alpha = dt / (kMotorTrimFilterTimeConstant + dt);
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (sample_mask & (1u << i)) {
+			candidate.filtered[i] += alpha * (_allocated_motors.control[i] - candidate.filtered[i]);
+		}
+	}
+
+	if (candidate.previous_sample_valid) {
+		candidate.valid_time_s += dt;
+	}
+
+	candidate.previous_sample_valid = true;
+	candidate.last_update = now;
+	candidate.invalid_since = 0;
+
+	if (!candidate.valid && candidate.valid_time_s >= required_time_s) {
+		candidate.valid = true;
+		PX4_INFO("[MOTOR_TRIM] %s ready time=%.2f/%.2f mask=0x%03x first4=(%.3f %.3f %.3f %.3f)",
+			 name, (double)candidate.valid_time_s, (double)required_time_s, (unsigned)candidate.mask,
+			 (double)candidate.filtered[0], (double)candidate.filtered[1],
+			 (double)candidate.filtered[2], (double)candidate.filtered[3]);
+	}
+}
+
+bool CustomActionControl::anyMotorTrimCandidateValid() const
+{
+	return _approach_strict_trim.valid || _search_strict_trim.valid || _search_loose_trim.valid;
+}
+
+const char *CustomActionControl::motorTrimSourceName(MotorTrimSource source) const
+{
+	switch (source) {
+	case MotorTrimSource::ApproachStrict: return "approach-strict";
+	case MotorTrimSource::SearchStrict: return "search-strict";
+	case MotorTrimSource::SearchLoose: return "search-loose";
+	default: return "none";
+	}
+}
+
+void CustomActionControl::selectBestMotorTrim()
+{
+	const MotorTrimCandidate *candidate = nullptr;
+	MotorTrimSource source = MotorTrimSource::None;
+
+	if (_approach_strict_trim.valid) {
+		candidate = &_approach_strict_trim;
+		source = MotorTrimSource::ApproachStrict;
+
+	} else if (_search_strict_trim.valid) {
+		candidate = &_search_strict_trim;
+		source = MotorTrimSource::SearchStrict;
+
+	} else if (_search_loose_trim.valid) {
+		candidate = &_search_loose_trim;
+		source = MotorTrimSource::SearchLoose;
+	}
+
+	if (candidate == nullptr) {
+		_motor_trim_source = MotorTrimSource::None;
+		_motor_trim_mask = 0;
+		_motor_trim_valid = false;
+
+		for (float &output : _motor_trim) {
+			output = 0.f;
+		}
+
+		return;
+	}
+
+	const bool source_changed = source != _motor_trim_source;
+	_motor_trim_source = source;
+	_motor_trim_mask = candidate->mask;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		_motor_trim[i] = candidate->filtered[i];
+	}
+
+	_motor_trim_valid = true;
+
+	if (source_changed) {
+		PX4_INFO("[MOTOR_TRIM] selected %s mask=0x%03x first4=(%.3f %.3f %.3f %.3f)",
+			 motorTrimSourceName(source), (unsigned)_motor_trim_mask,
+			 (double)_motor_trim[0], (double)_motor_trim[1],
+			 (double)_motor_trim[2], (double)_motor_trim[3]);
+	}
+}
+
+void CustomActionControl::updateMotorTrim(hrt_abstime now, bool actuator_updated)
+{
+	if (!actuator_updated || _trim_retreat_active) {
+		return;
+	}
+
+	if (_state == custom_action_status_s::STATE_SEARCH_TOP) {
+		updateMotorTrimCandidate(_search_loose_trim, now, true, _search_trim_required_s, "search-loose");
+		updateMotorTrimCandidate(_search_strict_trim, now, false, _search_trim_required_s, "search-strict");
+
+	} else if (_state == custom_action_status_s::STATE_TOP_APPROACH) {
+		updateMotorTrimCandidate(_approach_strict_trim, now, false, _approach_trim_required_s, "approach-strict");
+	}
+
+	selectBestMotorTrim();
+}
+
+bool CustomActionControl::updateMotorTrimSafety(hrt_abstime now)
+{
+	if (_state != custom_action_status_s::STATE_TOP_APPROACH) {
+		return false;
+	}
+
+	if (_trim_retreat_active) {
+		const bool distance_clear = sensorFresh(now) && minimumTopDistance() >= _param_top_gap.get();
+		const bool height_clear = localStateValid() && _local_position.z - _trim_retreat_start_z >= kTrimRetreatDistance;
+		const bool retreat_timed_out = now >= _trim_retreat_started
+					       && now - _trim_retreat_started >= kTrimRetreatTimeout;
+
+		if (distance_clear || height_clear || retreat_timed_out) {
+			PX4_WARN("[MOTOR_TRIM] retreat complete distance=%.3f dz=%.3f timeout=%s",
+				 (double)minimumTopDistance(), (double)(_local_position.z - _trim_retreat_start_z),
+				 retreat_timed_out ? "yes" : "no");
+			beginHandover(custom_action_status_s::REASON_TIMEOUT, _active_request_id,
+				      _active_source_system, _active_source_component, true);
+		}
+
+		return true;
+	}
+
+	if (anyMotorTrimCandidateValid() || minimumTopDistance() > trimHoldDistance()) {
+		_trim_hold_started = 0;
+		return false;
+	}
+
+	if (_trim_hold_started == 0) {
+		_trim_hold_started = now;
+		PX4_WARN("[MOTOR_TRIM] no candidate at %.3f m; bounded hold for %.2f s",
+			 (double)minimumTopDistance(), (double)math::max(_param_trim_time_max.get(), _param_trim_time_min.get()));
+	}
+
+	const float hold_limit_s = math::max(_param_trim_time_max.get(), _param_trim_time_min.get());
+
+	if (now >= _trim_hold_started
+	    && now - _trim_hold_started >= static_cast<hrt_abstime>(hold_limit_s * 1_s)) {
+		_trim_retreat_active = true;
+		_trim_retreat_started = now;
+		_trim_retreat_start_z = _local_position.z;
+		PX4_WARN("[MOTOR_TRIM] all candidates unavailable; retreating from top");
+		return true;
+	}
+
+	return false;
+}
+
+bool CustomActionControl::directActuatorReady(hrt_abstime now) const
+{
+	return _vehicle_control_mode.timestamp != 0
+	       && now >= _vehicle_control_mode.timestamp
+	       && now - _vehicle_control_mode.timestamp <= kControlModeTimeout
+	       && _vehicle_control_mode.flag_armed
+	       && _vehicle_control_mode.flag_control_offboard_enabled
+	       && !_vehicle_control_mode.flag_control_allocation_enabled;
+}
+
+bool CustomActionControl::motorTrimMatchesCurrent(hrt_abstime now) const
+{
+	if (!motorTrimWaitSampleStable(now)) {
+		return false;
+	}
+
+	float trim_sum = 0.f;
+	float current_sum = 0.f;
+	uint8_t motor_count = 0;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			trim_sum += _motor_trim[i];
+			current_sum += _allocated_motors.control[i];
+			++motor_count;
+		}
+	}
+
+	if (motor_count < kMinimumMotorCount || trim_sum <= FLT_EPSILON || current_sum <= FLT_EPSILON) {
+		return false;
+	}
+
+	// Compare motor proportions, not absolute collective thrust. A common rise
+	// in all motors while touching the roof is allowed; a transient attitude
+	// correction that changes the four-motor ratio is not.
+	const float collective_scale = current_sum / trim_sum;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			const float expected = _motor_trim[i] * collective_scale;
+			const float tolerance = math::max(kMotorTrimMatchAbsoluteFloor,
+							  expected * kMotorTrimMatchRelativeTolerance);
+
+			if (fabsf(_allocated_motors.control[i] - expected) > tolerance) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool CustomActionControl::motorTrimWaitSampleStable(hrt_abstime now) const
+{
+	if (!_motor_trim_valid || _motor_trim_mask == 0 || _allocated_motors.timestamp == 0
+	    || now < _allocated_motors.timestamp || now - _allocated_motors.timestamp > kActuatorTimeout) {
+		return false;
+	}
+
+	if (_vehicle_attitude.timestamp == 0 || now < _vehicle_attitude.timestamp
+	    || now - _vehicle_attitude.timestamp > kAttitudeTimeout
+	    || _vehicle_angular_velocity.timestamp == 0 || now < _vehicle_angular_velocity.timestamp
+	    || now - _vehicle_angular_velocity.timestamp > kAttitudeTimeout) {
+		return false;
+	}
+
+	const matrix::Eulerf attitude{matrix::Quatf{_vehicle_attitude.q}};
+	const float angle_limit = math::radians(_param_trim_angle.get());
+	const float rate_limit = math::radians(_param_trim_rate.get());
+
+	if (!PX4_ISFINITE(attitude.phi()) || !PX4_ISFINITE(attitude.theta())
+	    || fabsf(attitude.phi()) > angle_limit || fabsf(attitude.theta()) > angle_limit
+	    || !PX4_ISFINITE(_vehicle_angular_velocity.xyz[0])
+	    || !PX4_ISFINITE(_vehicle_angular_velocity.xyz[1])
+	    || fabsf(_vehicle_angular_velocity.xyz[0]) > rate_limit
+	    || fabsf(_vehicle_angular_velocity.xyz[1]) > rate_limit) {
+		return false;
+	}
+
+	uint8_t motor_count = 0;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			const float trim = _motor_trim[i];
+			const float current = _allocated_motors.control[i];
+
+			if (!PX4_ISFINITE(trim) || trim <= FLT_EPSILON || trim > _param_motor_limit.get()
+			    || !PX4_ISFINITE(current) || current <= FLT_EPSILON || current > _param_motor_limit.get()) {
+				return false;
+			}
+
+			++motor_count;
+		}
+	}
+
+	return motor_count >= kMinimumMotorCount;
+}
+
+void CustomActionControl::updateMotorTrimWhileWaiting(hrt_abstime now)
+{
+	if (!motorTrimWaitSampleStable(now)) {
+		_motor_trim_wait_last_update = now;
+		return;
+	}
+
+	const float dt = _motor_trim_wait_last_update != 0 && now >= _motor_trim_wait_last_update
+			 ? math::constrain(static_cast<float>(now - _motor_trim_wait_last_update) * 1e-6f, 0.001f, 0.1f)
+			 : 0.001f;
+	const float alpha = dt / (kMotorTrimFilterTimeConstant + dt);
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			_motor_trim[i] += alpha * (_allocated_motors.control[i] - _motor_trim[i]);
+		}
+	}
+
+	_motor_trim_wait_last_update = now;
+}
+
+bool CustomActionControl::preparePressHandover(hrt_abstime now)
+{
+	if (!_motor_trim_valid || _motor_trim_mask == 0 || _allocated_motors.timestamp == 0
+	    || now < _allocated_motors.timestamp || now - _allocated_motors.timestamp > kActuatorTimeout) {
+		return false;
+	}
+
+	uint8_t motor_count = 0;
+	float alignment_scale = 1.f;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			const float filtered_trim = _motor_trim[i];
+			const float current_output = _allocated_motors.control[i];
+
+			if (!PX4_ISFINITE(filtered_trim) || filtered_trim <= FLT_EPSILON
+			    || !PX4_ISFINITE(current_output) || current_output <= FLT_EPSILON
+			    || current_output > _param_motor_limit.get()) {
+				return false;
+			}
+
+			alignment_scale = math::max(alignment_scale, current_output / filtered_trim);
+			++motor_count;
+		}
+	}
+
+	if (motor_count < kMinimumMotorCount) {
+		return false;
+	}
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_motor_trim_mask & (1u << i)) {
+			const float current_output = _allocated_motors.control[i];
+			const float aligned_filtered_output = _motor_trim[i] * alignment_scale;
+
+			// A common scale preserves the filtered motor ratios. Choosing the
+			// largest current/trim ratio guarantees that the 300 ms blend never
+			// asks any individual motor to decrease.
+			if (!PX4_ISFINITE(aligned_filtered_output)
+			    || aligned_filtered_output + FLT_EPSILON < current_output
+			    || aligned_filtered_output > _param_motor_limit.get()) {
+				return false;
+			}
+
+			_press_entry_output[i] = current_output;
+			_press_base_output[i] = aligned_filtered_output;
+
+		} else {
+			_press_entry_output[i] = 0.f;
+			_press_base_output[i] = 0.f;
+		}
+	}
+
+	_press_output_mask = _motor_trim_mask;
+	PX4_INFO("[CONTACT_PRESS] filtered handover source=%s scale=%.3f entry=(%.3f %.3f %.3f %.3f) base=(%.3f %.3f %.3f %.3f)",
+		 motorTrimSourceName(_motor_trim_source), (double)alignment_scale,
+		 (double)_press_entry_output[0], (double)_press_entry_output[1],
+		 (double)_press_entry_output[2], (double)_press_entry_output[3],
+		 (double)_press_base_output[0], (double)_press_base_output[1],
+		 (double)_press_base_output[2], (double)_press_base_output[3]);
+	return true;
+}
+
+void CustomActionControl::publishDirectMotorSetpoint(hrt_abstime now)
+{
+	if (!_motor_trim_valid || _press_output_mask == 0 || !directActuatorReady(now)) {
+		return;
+	}
+
+	const bool takeover_start = _press_output_started == 0;
+
+	if (takeover_start) {
+		_press_output_started = now;
+		PX4_INFO("[CONTACT_PRESS] direct actuator ready; starting monotonic 300 ms filtered-trim blend");
+	}
+
+	const hrt_abstime blend_elapsed_us = now >= _press_output_started ? now - _press_output_started : 0;
+	const float blend_progress = math::constrain(static_cast<float>(blend_elapsed_us)
+				     / static_cast<float>(kPressMotorBlendTime), 0.f, 1.f);
+	const bool pressure_ramp_start = blend_progress >= 1.f
+					 && _state == custom_action_status_s::STATE_CONTACT_PRESS_WAIT;
+
+	if (pressure_ramp_start) {
+		_state = custom_action_status_s::STATE_CONTACT_PRESS;
+		_reason = custom_action_status_s::REASON_NONE;
+		_pressure_ramp_started = now;
+		PX4_INFO("[CONTACT_PRESS] filtered-trim blend complete; pressure ramp active");
+	}
+
+	const float pressure_elapsed = _pressure_ramp_started != 0 && now >= _pressure_ramp_started
+				       ? static_cast<float>(now - _pressure_ramp_started) * 1e-6f
+				       : 0.f;
+	actuator_motors_s motors{};
+	motors.timestamp = now;
+	motors.timestamp_sample = now;
+	motors.reversible_flags = 0;
+
+	const float target_time_s = math::max(_param_press_time.get(), 0.2f);
+	const float pressure_progress = math::constrain(pressure_elapsed / target_time_s, 0.f, 1.f);
+	const float requested_gain = math::max(_param_press_gain.get(), 0.f) * pressure_progress;
+	const float requested_scale = 1.f + requested_gain;
+	float scale = requested_scale;
+	const float motor_limit = _param_motor_limit.get();
+	uint8_t limiting_motor = 0;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if ((_press_output_mask & (1u << i)) && _press_base_output[i] > FLT_EPSILON) {
+			const float motor_scale_limit = motor_limit / _press_base_output[i];
+
+			if (motor_scale_limit < scale) {
+				scale = motor_scale_limit;
+				limiting_motor = static_cast<uint8_t>(i + 1);
+			}
+		}
+	}
+
+	// Never let any motor fall below its contact baseline. Keeping the scale at
+	// least the previously applied value also makes the ramp monotonic if a
+	// parameter changes while pressure mode is active.
+	scale = math::max(scale, 1.f + _active_pressure_gain);
+	_active_pressure_gain = math::max(scale - 1.f, 0.f);
+	const bool output_limited = scale + FLT_EPSILON < requested_scale;
+	_pressure_ramp_complete = pressure_progress >= 1.f;
+	_limiting_motor = output_limited ? limiting_motor : 0;
+
+	if (output_limited != _motor_output_limited) {
+		if (output_limited) {
+			PX4_WARN("[CONTACT_PRESS] motor %u limit active requested=%.3f applied=%.3f",
+				 (unsigned)_limiting_motor, (double)requested_gain, (double)_active_pressure_gain);
+
+		} else {
+			PX4_INFO("[CONTACT_PRESS] motor limit cleared");
+		}
+	}
+
+	_motor_output_limited = output_limited;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_press_output_mask & (1u << i)) {
+			const float pressure_target = _press_base_output[i] * scale;
+			motors.control[i] = _press_entry_output[i]
+					    + blend_progress * (pressure_target - _press_entry_output[i]);
+
+		} else {
+			motors.control[i] = NAN;
+		}
+	}
+
+	_actuator_motors_pub.publish(motors);
+
+	if (pressure_ramp_start) {
+		publishStatus(true);
+		publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
+				static_cast<uint8_t>(Result::ContactPressEntered), _active_request_id,
+				_active_source_system, _active_source_component);
+	}
 }
 
 bool CustomActionControl::captureHoldPoint()
@@ -250,8 +854,14 @@ void CustomActionControl::startSearchTop(const vehicle_command_s &command, uint1
 	_verify_started = 0;
 	_press_started = 0;
 	_handover_started = 0;
+	resetMotorTrim();
+	const float search_distance_time = _param_top_distance.get()
+					   / math::max(_param_top_velocity.get(), 0.01f);
+	const float search_available_time = math::min(_param_top_time.get(), search_distance_time);
+	_search_trim_required_s = constrainedTrimTime(search_available_time);
 	PX4_INFO("[SEARCH_TOP] entered xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z, (double)_locked_yaw);
+	PX4_INFO("[MOTOR_TRIM] search capture target=%.2f s", (double)_search_trim_required_s);
 	publishStatus(true);
 	publishAck(command, vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
 		   static_cast<uint8_t>(Result::CustomStarted));
@@ -273,6 +883,7 @@ void CustomActionControl::beginHandover(uint8_t reason, uint16_t handover_id,
 	_verify_started = 0;
 	_press_started = 0;
 	_contact_threshold_frames = 0;
+	resetMotorTrim();
 	PX4_WARN("[CUSTOM] handover id=%u reason=%s(%u) hold=(%.2f, %.2f, %.2f)",
 		 _handover_id, reasonName(reason), reason,
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z);
@@ -376,13 +987,28 @@ void CustomActionControl::enterTopApproach()
 	_verify_min_distance = NAN;
 	_verify_max_distance = NAN;
 	_contact_threshold_frames = 0;
+	resetMotorTrimCandidate(_approach_strict_trim);
+	selectBestMotorTrim();
+	_trim_hold_started = 0;
+	_trim_retreat_started = 0;
+	_trim_retreat_active = false;
+	const float available_distance = math::max(minimumTopDistance() - _param_contact_distance.get(), 0.f);
+	const float available_time = available_distance / math::max(_param_approach_velocity.get(), 0.005f);
+	_approach_trim_required_s = constrainedTrimTime(available_time);
 	PX4_INFO("[TOP_FOUND] raw=%.3f filtered=%.3f m; slow approach",
 		 (double)minimumTopDistance(), (double)_filtered_top_distance);
+	PX4_INFO("[MOTOR_TRIM] approach capture target=%.2f s hold_distance=%.3f m",
+		 (double)_approach_trim_required_s, (double)trimHoldDistance());
 	publishStatus(true);
 }
 
 void CustomActionControl::enterContactVerify(hrt_abstime now)
 {
+	if (!_motor_trim_valid) {
+		PX4_WARN("[CONTACT_VERIFY] blocked: motor trim unavailable");
+		return;
+	}
+
 	_state = custom_action_status_s::STATE_CONTACT_VERIFY;
 	_verify_started = now;
 	_verify_min_distance = _filtered_top_distance;
@@ -394,25 +1020,52 @@ void CustomActionControl::enterContactVerify(hrt_abstime now)
 	publishStatus(true);
 }
 
-void CustomActionControl::enterContactPress(hrt_abstime now)
+void CustomActionControl::enterMotorTrimWait(hrt_abstime now)
 {
-	if (!captureHoldPoint()) {
-		beginHandover(custom_action_status_s::REASON_ESTIMATOR, _active_request_id,
-				      _active_source_system, _active_source_component, true);
+	if (!_motor_trim_valid || !captureHoldPoint()) {
+		PX4_WARN("[MOTOR_TRIM] contact confirmed but filtered trim unavailable");
+		beginHandover(custom_action_status_s::REASON_MOTOR_TRIM_MISMATCH, _active_request_id,
+			      _active_source_system, _active_source_component, true);
 		return;
 	}
 
-	_state = custom_action_status_s::STATE_CONTACT_PRESS;
+	_state = custom_action_status_s::STATE_MOTOR_TRIM_WAIT;
 	_owner = custom_action_status_s::OWNER_CUSTOM;
-	_reason = custom_action_status_s::REASON_TOP_DISTANCE;
+	_reason = custom_action_status_s::REASON_NONE;
+	_verify_started = 0;
+	_motor_trim_match_started = now;
+	_motor_trim_match_stable_started = 0;
+	_motor_trim_wait_last_update = now;
+	_press_started = 0;
+	_press_output_started = 0;
+	_pressure_ramp_started = 0;
+	_contact_threshold_frames = 0;
+	PX4_INFO("[MOTOR_TRIM] contact confirmed; waiting for current motor ratios to match filtered %s trim",
+		 motorTrimSourceName(_motor_trim_source));
+	publishStatus(true);
+}
+
+void CustomActionControl::enterContactPress(hrt_abstime now)
+{
+	if (_state != custom_action_status_s::STATE_MOTOR_TRIM_WAIT || !preparePressHandover(now)) {
+		PX4_WARN("[CONTACT_PRESS] filtered handover changed before takeover; restarting match timer");
+		_motor_trim_match_stable_started = 0;
+		return;
+	}
+
+	_state = custom_action_status_s::STATE_CONTACT_PRESS_WAIT;
+	_owner = custom_action_status_s::OWNER_CUSTOM;
+	_reason = custom_action_status_s::REASON_NONE;
 	_verify_started = 0;
 	_press_started = now;
+	_press_output_started = 0;
+	_pressure_ramp_started = 0;
+	_motor_trim_match_started = 0;
+	_motor_trim_match_stable_started = 0;
 	_contact_threshold_frames = 0;
-	PX4_INFO("[CONTACT_PRESS] stable contact at z=%.2f; pressure ramp active", (double)_hold_z);
+	PX4_INFO("[CONTACT_PRESS] stable filtered baseline at z=%.2f; waiting for direct actuator takeover",
+		 (double)_hold_z);
 	publishStatus(true);
-	publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
-			static_cast<uint8_t>(Result::ContactPressEntered), _active_request_id,
-			_active_source_system, _active_source_component);
 }
 
 void CustomActionControl::releaseToLegacy(uint8_t reason)
@@ -427,6 +1080,7 @@ void CustomActionControl::releaseToLegacy(uint8_t reason)
 	_press_started = 0;
 	_contact_threshold_frames = 0;
 	_filtered_top_distance = NAN;
+	resetMotorTrim();
 	publishStatus(true);
 }
 
@@ -442,6 +1096,7 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 	_press_started = 0;
 	_contact_threshold_frames = 0;
 	_filtered_top_distance = NAN;
+	resetMotorTrim();
 	PX4_INFO("[CUSTOM] control released to Commander: %s", reasonName(reason));
 	publishStatus(true);
 }
@@ -449,45 +1104,37 @@ void CustomActionControl::takeCommanderOwnership(uint8_t reason)
 void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 {
 	const bool precontact = isPrecontactState();
-	const bool contact_press = _state == custom_action_status_s::STATE_CONTACT_PRESS;
+	const bool contact_press = _state == custom_action_status_s::STATE_CONTACT_PRESS
+				   || _state == custom_action_status_s::STATE_CONTACT_PRESS_WAIT;
 	offboard_control_mode_s control_mode{};
 	control_mode.timestamp = now;
+
+	if (contact_press) {
+		// Direct actuator mode disables the position, attitude, rate and control
+		// allocation pipeline. The active command blends monotonically into the
+		// aligned filtered trim, then multiplies it by the common pressure gain.
+		control_mode.direct_actuator = true;
+		_offboard_control_mode_pub.publish(control_mode);
+		publishDirectMotorSetpoint(now);
+		return;
+	}
+
 	control_mode.position = true;
-	control_mode.velocity = precontact || contact_press;
-	control_mode.acceleration = contact_press;
+	control_mode.velocity = precontact;
 	_offboard_control_mode_pub.publish(control_mode);
 
 	trajectory_setpoint_s setpoint{};
 	setpoint.timestamp = now;
-	// Keep XY fixed while searching and approaching. Once contact pressure is
-	// active, remove horizontal position/velocity feedback and command zero
-	// horizontal acceleration instead. This keeps the desired thrust vector
-	// normal to a horizontal ceiling while the attitude/rate controllers remain
-	// fully active.
-	setpoint.position[0] = contact_press ? NAN : _hold_x;
-	setpoint.position[1] = contact_press ? NAN : _hold_y;
-	setpoint.position[2] = (precontact || contact_press) ? NAN : _hold_z;
+	setpoint.position[0] = _hold_x;
+	setpoint.position[1] = _hold_y;
+	setpoint.position[2] = precontact ? NAN : _hold_z;
 	setpoint.velocity[0] = NAN;
 	setpoint.velocity[1] = NAN;
-	setpoint.velocity[2] = precontact ? -activeClimbVelocity() : (contact_press ? 0.f : NAN);
+	setpoint.velocity[2] = precontact ? verticalVelocityNed() : NAN;
 
 	for (int i = 0; i < 3; ++i) {
 		setpoint.acceleration[i] = NAN;
 		setpoint.jerk[i] = NAN;
-	}
-
-	if (contact_press) {
-		setpoint.acceleration[0] = 0.f;
-		setpoint.acceleration[1] = 0.f;
-		const float elapsed = now >= _press_started
-				      ? static_cast<float>(now - _press_started) * 1e-6f
-				      : 0.f;
-		const float thrust_offset = math::min(_param_press_add.get(), _param_press_ramp.get() * elapsed);
-		const float hover_thrust = math::max(_param_hover_thrust.get(), 0.05f);
-		// Keep the vertical velocity loop continuous with a reachable zero-velocity
-		// target, then add the pressure acceleration as feed-forward. This preserves
-		// the pre-contact thrust integrator without an unreachable position target.
-		setpoint.acceleration[2] = -CONSTANTS_ONE_G * thrust_offset / hover_thrust;
 	}
 
 	setpoint.yaw = _locked_yaw;
@@ -511,6 +1158,24 @@ void CustomActionControl::publishStatus(bool force)
 	status.control_owner = _owner;
 	status.handover_id = _handover_id;
 	status.reason = _reason;
+	status.pressure_target_gain = math::max(_param_press_gain.get(), 0.f);
+	status.pressure_applied_gain = _active_pressure_gain;
+	status.pressure_time_s = math::max(_param_press_time.get(), 0.2f);
+	status.pressure_progress = 0.f;
+
+	if (_state == custom_action_status_s::STATE_CONTACT_PRESS && _pressure_ramp_started != 0
+	    && now >= _pressure_ramp_started) {
+		const float elapsed_s = static_cast<float>(now - _pressure_ramp_started) * 1e-6f;
+		status.pressure_progress = math::constrain(elapsed_s / status.pressure_time_s, 0.f, 1.f);
+	}
+
+	status.trim_source = static_cast<uint8_t>(_motor_trim_source);
+	status.trim_candidate_mask = (_search_loose_trim.valid ? custom_action_status_s::TRIM_CANDIDATE_SEARCH_LOOSE : 0)
+				     | (_search_strict_trim.valid ? custom_action_status_s::TRIM_CANDIDATE_SEARCH_STRICT : 0)
+				     | (_approach_strict_trim.valid ? custom_action_status_s::TRIM_CANDIDATE_APPROACH_STRICT : 0);
+	status.limiting_motor = _limiting_motor;
+	status.pressure_limited = _motor_output_limited;
+	status.pressure_ramp_complete = _pressure_ramp_complete;
 	_status_pub.publish(status);
 	_last_status_publish = now;
 }
@@ -526,6 +1191,10 @@ void CustomActionControl::Run()
 	updateParams();
 	_vehicle_local_position_sub.update(&_local_position);
 	_vehicle_status_sub.update(&_vehicle_status);
+	_vehicle_control_mode_sub.update(&_vehicle_control_mode);
+	_vehicle_attitude_sub.update(&_vehicle_attitude);
+	_vehicle_angular_velocity_sub.update(&_vehicle_angular_velocity);
+	const bool actuator_motors_updated = _actuator_motors_sub.update(&_allocated_motors);
 	const bool top_distance_updated = _top_distance_sub.update(&_top_distance);
 
 	vehicle_command_s command{};
@@ -565,6 +1234,13 @@ void CustomActionControl::Run()
 		new_distance_frame = true;
 	}
 
+	if (_state == custom_action_status_s::STATE_SEARCH_TOP
+	    || _state == custom_action_status_s::STATE_TOP_APPROACH) {
+		updateMotorTrim(now, actuator_motors_updated);
+	}
+
+	updateMotorTrimSafety(now);
+
 	if (isPrecontactState()) {
 		if (!localStateValid()) {
 			beginHandover(custom_action_status_s::REASON_ESTIMATOR, _active_request_id,
@@ -577,6 +1253,11 @@ void CustomActionControl::Run()
 		} else if (!sensorFresh(now)) {
 			beginHandover(custom_action_status_s::REASON_SENSOR_TIMEOUT, _active_request_id,
 				      _active_source_system, _active_source_component, true);
+
+		} else if (_trim_retreat_active) {
+			// The trim-safety path temporarily retains TOP_APPROACH ownership while
+			// commanding a bounded downward retreat. It completes through
+			// updateMotorTrimSafety(), not the normal upward-search transitions.
 
 		} else if (_start_z - _local_position.z >= _param_top_distance.get()) {
 			beginHandover(custom_action_status_s::REASON_MAX_DISTANCE, _active_request_id,
@@ -597,13 +1278,17 @@ void CustomActionControl::Run()
 			if (_filtered_top_distance > _param_top_gap.get() + _param_top_hysteresis.get()) {
 				_state = custom_action_status_s::STATE_SEARCH_TOP;
 				_contact_threshold_frames = 0;
+				resetMotorTrimCandidate(_approach_strict_trim);
+				selectBestMotorTrim();
+				_trim_hold_started = 0;
 				PX4_INFO("[TOP_APPROACH] top lost; resume search");
 				publishStatus(true);
 
 			} else {
 				const float raw_minimum_distance = minimumTopDistance();
 
-				if (raw_minimum_distance <= _param_contact_distance.get()
+				if (_motor_trim_valid
+				    && raw_minimum_distance <= _param_contact_distance.get()
 				    && topDistanceCountAtOrBelow(_param_contact_distance.get()) >= kContactSensorCountRequired) {
 					if (_contact_threshold_frames < kContactThresholdFramesRequired) {
 						++_contact_threshold_frames;
@@ -636,11 +1321,53 @@ void CustomActionControl::Run()
 
 				} else if (_verify_started != 0 && now >= _verify_started
 					   && now - _verify_started >= static_cast<hrt_abstime>(_param_contact_time.get() * 1_s)) {
-					enterContactPress(now);
+					enterMotorTrimWait(now);
 				}
 			}
 
+		} else if (_state == custom_action_status_s::STATE_MOTOR_TRIM_WAIT) {
+			if (new_distance_frame
+			    && (minimumTopDistance() > _param_contact_distance.get() + _param_top_hysteresis.get()
+				|| topDistanceCountAtOrBelow(_param_contact_distance.get()) < kContactSensorCountRequired)) {
+				PX4_WARN("[MOTOR_TRIM] contact lost while waiting for filtered baseline match");
+				enterTopApproach();
+
+			} else if (actuator_motors_updated) {
+				updateMotorTrimWhileWaiting(now);
+
+				if (motorTrimMatchesCurrent(now)) {
+					if (_motor_trim_match_stable_started == 0) {
+						_motor_trim_match_stable_started = now;
+						PX4_INFO("[MOTOR_TRIM] current ratios match filtered baseline; confirming for 250 ms");
+					}
+
+					if (now >= _motor_trim_match_stable_started
+					    && now - _motor_trim_match_stable_started >= kMotorTrimMatchStableTime) {
+						enterContactPress(now);
+					}
+
+				} else {
+					_motor_trim_match_stable_started = 0;
+				}
+			}
+
+			if (_state == custom_action_status_s::STATE_MOTOR_TRIM_WAIT
+			    && _motor_trim_match_started != 0 && now >= _motor_trim_match_started
+			    && now - _motor_trim_match_started >= kMotorTrimMatchTimeout) {
+				PX4_ERR("[MOTOR_TRIM] current motor ratios did not match filtered baseline within 1 s");
+				beginHandover(custom_action_status_s::REASON_MOTOR_TRIM_MISMATCH, _active_request_id,
+					      _active_source_system, _active_source_component, true);
+			}
+
+			}
 		}
+
+	if (_state == custom_action_status_s::STATE_CONTACT_PRESS_WAIT && _press_started != 0
+	    && now >= _press_started && !directActuatorReady(now)
+	    && now - _press_started >= kDirectActuatorTakeoverTimeout) {
+		PX4_ERR("[CONTACT_PRESS] direct actuator takeover timed out");
+		beginHandover(custom_action_status_s::REASON_ACTUATOR_TIMEOUT, _active_request_id,
+			      _active_source_system, _active_source_component, true);
 	}
 
 	const hrt_abstime handover_elapsed = (_handover_started != 0 && now >= _handover_started)
@@ -723,6 +1450,24 @@ int CustomActionControl::print_status()
 		 _state, _owner, _reason, _handover_id, _top_distance.sequence, _top_distance.valid_mask);
 	PX4_INFO("hold xyz=(%.2f, %.2f, %.2f) yaw=%.2f",
 		 (double)_hold_x, (double)_hold_y, (double)_hold_z, (double)_locked_yaw);
+	PX4_INFO("motor trim valid=%s source=%s mask=0x%03x gain=%.3f limited=%s first4=(%.3f %.3f %.3f %.3f)",
+		 _motor_trim_valid ? "yes" : "no", motorTrimSourceName(_motor_trim_source), (unsigned)_motor_trim_mask,
+		 (double)_active_pressure_gain, _motor_output_limited ? "yes" : "no",
+		 (double)_motor_trim[0], (double)_motor_trim[1], (double)_motor_trim[2], (double)_motor_trim[3]);
+	const hrt_abstime now = hrt_absolute_time();
+	const float pressure_time_s = math::max(_param_press_time.get(), 0.2f);
+	const float pressure_elapsed_s = _press_started != 0 && now >= _press_started
+				       ? static_cast<float>(now - _press_started) * 1e-6f : 0.f;
+	PX4_INFO("pressure target=%.3f applied=%.3f time=%.2f/%.2fs complete=%s limiting_motor=%u",
+		 (double)math::max(_param_press_gain.get(), 0.f), (double)_active_pressure_gain,
+		 (double)math::min(pressure_elapsed_s, pressure_time_s), (double)pressure_time_s,
+		 _pressure_ramp_complete ? "yes" : "no", (unsigned)_limiting_motor);
+	PX4_INFO("trim candidates loose=%s %.2fs strict=%s %.2fs approach=%s %.2fs targets=(%.2f %.2f)s hold=%s retreat=%s",
+		 _search_loose_trim.valid ? "yes" : "no", (double)_search_loose_trim.valid_time_s,
+		 _search_strict_trim.valid ? "yes" : "no", (double)_search_strict_trim.valid_time_s,
+		 _approach_strict_trim.valid ? "yes" : "no", (double)_approach_strict_trim.valid_time_s,
+		 (double)_search_trim_required_s, (double)_approach_trim_required_s,
+		 _trim_hold_started != 0 ? "yes" : "no", _trim_retreat_active ? "yes" : "no");
 	return 0;
 }
 

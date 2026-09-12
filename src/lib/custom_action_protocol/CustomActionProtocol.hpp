@@ -55,8 +55,31 @@ constexpr uint16_t kMotorPwmSimMinimumUs = 1000;
 constexpr uint16_t kMotorPwmSimRangeUs = 1000;
 constexpr uint8_t kMotorOutputCount = 4;
 
+// Pressure-detail format. PING.time_usec carries four uint16 values:
+// requested gain (x10000), applied gain (x10000), time progress (x1000), and
+// configured rise time (milliseconds). PING.seq carries the selected trim
+// source, available candidates, limiting motor and completion flags.
+constexpr uint32_t kPressureDetailMarkerMask = 0xF0000000u;
+constexpr uint32_t kPressureDetailMarker = 0xD0000000u;
+constexpr uint32_t kPressureDetailVersionMask = 0x0F000000u;
+constexpr uint32_t kPressureDetailVersion = 0x01000000u;
+constexpr uint32_t kPressureDetailTrimSourceMask = 0x00C00000u;
+constexpr uint8_t kPressureDetailTrimSourceShift = 22;
+constexpr uint32_t kPressureDetailCandidateMask = 0x00380000u;
+constexpr uint8_t kPressureDetailCandidateShift = 19;
+constexpr uint32_t kPressureDetailLimitingMotorMask = 0x00070000u;
+constexpr uint8_t kPressureDetailLimitingMotorShift = 16;
+constexpr uint32_t kPressureDetailLimitedFlag = 0x00008000u;
+constexpr uint32_t kPressureDetailCompleteFlag = 0x00004000u;
+constexpr uint32_t kPressureDetailValidFlag = 0x00002000u;
+constexpr uint32_t kPressureDetailSequenceMask = 0x00001FFFu;
+constexpr uint8_t kPressureDetailValueBits = 16;
+constexpr float kPressureDetailGainScale = 10000.f;
+constexpr float kPressureDetailProgressScale = 1000.f;
+constexpr float kPressureDetailTimeScale = 1000.f;
+
 // SEARCH_TOP status format. The controller publishes custom_action_status at
-// 2 Hz, and the MAVLink PING stream forwards every update. PING.seq carries
+// 5 Hz, and the MAVLink PING stream forwards every update. PING.seq carries
 // state/owner/reason plus a small frame counter; PING.time_usec carries the
 // current handover id. Repetition makes state display tolerant of WiFi/UDP
 // packet loss without adding a custom MAVLink dialect.

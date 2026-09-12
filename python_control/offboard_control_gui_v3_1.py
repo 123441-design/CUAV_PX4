@@ -95,6 +95,24 @@ CUSTOM_STATUS_REASON_MASK = 0x0003C000
 CUSTOM_STATUS_REASON_SHIFT = 14
 CUSTOM_STATUS_SEQUENCE_MASK = 0x00003FFF
 CUSTOM_STATUS_STALE_S = 1.5
+PRESSURE_DETAIL_MARKER_MASK = 0xF0000000
+PRESSURE_DETAIL_MARKER = 0xD0000000
+PRESSURE_DETAIL_VERSION_MASK = 0x0F000000
+PRESSURE_DETAIL_VERSION = 0x01000000
+PRESSURE_DETAIL_TRIM_SOURCE_MASK = 0x00C00000
+PRESSURE_DETAIL_TRIM_SOURCE_SHIFT = 22
+PRESSURE_DETAIL_CANDIDATE_MASK = 0x00380000
+PRESSURE_DETAIL_CANDIDATE_SHIFT = 19
+PRESSURE_DETAIL_LIMITING_MOTOR_MASK = 0x00070000
+PRESSURE_DETAIL_LIMITING_MOTOR_SHIFT = 16
+PRESSURE_DETAIL_LIMITED_FLAG = 0x00008000
+PRESSURE_DETAIL_COMPLETE_FLAG = 0x00004000
+PRESSURE_DETAIL_VALID_FLAG = 0x00002000
+PRESSURE_DETAIL_SEQUENCE_MASK = 0x00001FFF
+PRESSURE_DETAIL_STALE_S = 1.0
+PRESSURE_GAIN_SCALE = 10000.0
+PRESSURE_PROGRESS_SCALE = 1000.0
+PRESSURE_TIME_SCALE = 1000.0
 TOP_MODE_POSITION_MAX_AGE_S = 1.0
 TOP_MODE_DISTANCE_MAX_AGE_S = 1.0
 CUSTOM_STATE_NAMES = {
@@ -103,6 +121,8 @@ CUSTOM_STATE_NAMES = {
     2: "TOP_APPROACH",
     3: "CONTACT_VERIFY",
     4: "CONTACT_PRESS",
+    5: "CONTACT_PRESS_WAIT",
+    6: "MOTOR_TRIM_WAIT",
 }
 CUSTOM_OWNER_NAMES = {0: "LEGACY", 1: "CUSTOM", 2: "HANDOVER", 3: "COMMANDER"}
 CUSTOM_REASON_NAMES = {
@@ -115,13 +135,17 @@ CUSTOM_REASON_NAMES = {
     6: "HEADING_RESET",
     7: "LAND",
     8: "TOP_DISTANCE",
+    9: "ACTUATOR_TIMEOUT",
+    10: "MOTOR_TRIM_MISMATCH",
 }
 CUSTOM_STATE_ZH = {
     0: "待机",
     1: "正在快速寻顶",
     2: "正在缓慢贴顶",
     3: "正在缓慢贴顶",
-    4: "贴顶完成，正在保持压力",
+    4: "贴顶加压中",
+    5: "触顶已确认，等待加压控制接管",
+    6: "触顶已确认，等待电机基准稳定",
 }
 CUSTOM_OWNER_ZH = {0: "上位机", 1: "飞控触顶状态机", 2: "等待控制交接", 3: "飞控Commander"}
 CUSTOM_REASON_ZH = {
@@ -134,6 +158,25 @@ CUSTOM_REASON_ZH = {
     6: "航向发生重置",
     7: "执行降落",
     8: "顶部距离确认",
+    9: "加压控制接管超时",
+    10: "电机基准与当前输出不匹配",
+}
+TRIM_SOURCE_NAMES = {
+    0: "NONE",
+    1: "SEARCH_LOOSE",
+    2: "SEARCH_STRICT",
+    3: "APPROACH_STRICT",
+}
+TRIM_SOURCE_ZH = {
+    0: "尚未获取",
+    1: "快速寻顶阶段（宽松条件）",
+    2: "快速寻顶阶段（严格条件）",
+    3: "缓慢贴顶阶段（严格条件）",
+}
+TRIM_CANDIDATE_ZH = {
+    0x01: "快速寻顶阶段（宽松条件）",
+    0x02: "快速寻顶阶段（严格条件）",
+    0x04: "缓慢贴顶阶段（严格条件）",
 }
 CUSTOM_START_RESULT_ZH = {
     CUSTOM_RESULT_START_BUSY: "上一项触顶流程或控制交接尚未结束",
@@ -187,6 +230,11 @@ MAX_MOVE_M = 5.0
 HEARTBEAT_TIMEOUT_S = 3.0
 GROUND_DISTANCE_RATE_HZ = 3.0
 LOCAL_POSITION_RATE_HZ = 5.0
+OPTICAL_FLOW_RATE_HZ = 5.0
+OPTICAL_FLOW_STALE_S = 1.0
+OPTICAL_FLOW_POOR_MAX = 49
+OPTICAL_FLOW_GOOD_MIN = 100
+OPTICAL_FLOW_QUALITY_HYSTERESIS = 5
 
 
 def load_saved_connection() -> str:
@@ -322,6 +370,33 @@ def px4_mode_name(custom_mode: int) -> str:
     return auto_names.get(sub, "AUTO") if main == 4 else main_names.get(main, f"MODE({main},{sub})")
 
 
+def optical_flow_quality_level(quality: int, previous: str | None = None) -> str:
+    """Classify 0..255 flow quality with hysteresis around the display thresholds."""
+    quality = max(0, min(int(quality), 255))
+    if previous == "poor" and quality < OPTICAL_FLOW_POOR_MAX + 1 + OPTICAL_FLOW_QUALITY_HYSTERESIS:
+        return "poor"
+    if previous == "fair":
+        if quality < OPTICAL_FLOW_POOR_MAX + 1 - OPTICAL_FLOW_QUALITY_HYSTERESIS:
+            return "poor"
+        if quality < OPTICAL_FLOW_GOOD_MIN + OPTICAL_FLOW_QUALITY_HYSTERESIS:
+            return "fair"
+    if previous == "good" and quality >= OPTICAL_FLOW_GOOD_MIN - OPTICAL_FLOW_QUALITY_HYSTERESIS:
+        return "good"
+    if quality <= OPTICAL_FLOW_POOR_MAX:
+        return "poor"
+    if quality < OPTICAL_FLOW_GOOD_MIN:
+        return "fair"
+    return "good"
+
+
+def motor_pwm_to_normalized(pwm_us: int | float) -> float:
+    """Convert the displayed PWM range to a clamped 0..1 motor command."""
+    return min(
+        max((float(pwm_us) - MOTOR_PWM_DISPLAY_MIN_US) / MOTOR_PWM_DISPLAY_RANGE_US, 0.0),
+        1.0,
+    )
+
+
 @dataclass(frozen=True)
 class MyLinkState:
     connected: bool = False
@@ -347,6 +422,8 @@ class MyLinkState:
     top_distance_age_s: float | None = None
     ground_distance_mm: int | None = None
     ground_distance_age_s: float | None = None
+    optical_flow_quality: int | None = None
+    optical_flow_age_s: float | None = None
     motor_outputs_pwm_us: tuple[int | None, int | None, int | None, int | None] = (None, None, None, None)
     motor_output_age_s: float | None = None
     custom_action_state: int | None = None
@@ -355,6 +432,16 @@ class MyLinkState:
     custom_action_reason: int | None = None
     custom_action_handover_id: int = 0
     custom_action_age_s: float | None = None
+    pressure_target_gain: float | None = None
+    pressure_applied_gain: float | None = None
+    pressure_progress: float | None = None
+    pressure_time_s: float | None = None
+    pressure_trim_source: int | None = None
+    pressure_candidate_mask: int = 0
+    pressure_limiting_motor: int = 0
+    pressure_limited: bool = False
+    pressure_complete: bool = False
+    pressure_age_s: float | None = None
     rx_counts: tuple[tuple[str, int], ...] = ()
     tx_setpoints: int = 0
     error: str = ""
@@ -386,6 +473,21 @@ class CustomActionStatusFrame:
     active: bool
     reason: int
     handover_id: int
+    received_at: float
+
+
+@dataclass(frozen=True)
+class PressureDetailFrame:
+    sequence: int
+    target_gain: float
+    applied_gain: float
+    progress: float
+    pressure_time_s: float
+    trim_source: int
+    candidate_mask: int
+    limiting_motor: int
+    limited: bool
+    complete: bool
     received_at: float
 
 
@@ -498,6 +600,46 @@ def decode_custom_action_status_mavlink(
         active=bool(metadata & CUSTOM_STATUS_ACTIVE_FLAG),
         reason=reason,
         handover_id=handover_id,
+        received_at=time.monotonic() if received_at is None else received_at,
+    )
+
+
+def decode_pressure_detail_mavlink(
+    message, received_at: float | None = None
+) -> PressureDetailFrame | None:
+    """Decode pressure progress and motor-limit details from one targeted PING."""
+    if message.get_type() != "PING":
+        return None
+    metadata = int(message.seq)
+    if (
+        metadata & PRESSURE_DETAIL_MARKER_MASK != PRESSURE_DETAIL_MARKER
+        or metadata & PRESSURE_DETAIL_VERSION_MASK != PRESSURE_DETAIL_VERSION
+        or not metadata & PRESSURE_DETAIL_VALID_FLAG
+    ):
+        return None
+    packed = int(message.time_usec)
+    target_gain = (packed & 0xFFFF) / PRESSURE_GAIN_SCALE
+    applied_gain = ((packed >> 16) & 0xFFFF) / PRESSURE_GAIN_SCALE
+    progress = ((packed >> 32) & 0xFFFF) / PRESSURE_PROGRESS_SCALE
+    pressure_time_s = ((packed >> 48) & 0xFFFF) / PRESSURE_TIME_SCALE
+    trim_source = (metadata & PRESSURE_DETAIL_TRIM_SOURCE_MASK) >> PRESSURE_DETAIL_TRIM_SOURCE_SHIFT
+    candidate_mask = (metadata & PRESSURE_DETAIL_CANDIDATE_MASK) >> PRESSURE_DETAIL_CANDIDATE_SHIFT
+    limiting_motor = (
+        metadata & PRESSURE_DETAIL_LIMITING_MOTOR_MASK
+    ) >> PRESSURE_DETAIL_LIMITING_MOTOR_SHIFT
+    if trim_source > 3 or candidate_mask > 7 or limiting_motor > 4 or progress > 1.0:
+        return None
+    return PressureDetailFrame(
+        sequence=metadata & PRESSURE_DETAIL_SEQUENCE_MASK,
+        target_gain=target_gain,
+        applied_gain=applied_gain,
+        progress=progress,
+        pressure_time_s=pressure_time_s,
+        trim_source=trim_source,
+        candidate_mask=candidate_mask,
+        limiting_motor=limiting_motor,
+        limited=bool(metadata & PRESSURE_DETAIL_LIMITED_FLAG),
+        complete=bool(metadata & PRESSURE_DETAIL_COMPLETE_FLAG),
         received_at=time.monotonic() if received_at is None else received_at,
     )
 
@@ -913,6 +1055,7 @@ class MyLinkMavlinkClient:
         self._last_heartbeat: float | None = None
         self._last_local_position: float | None = None
         self._last_ground_distance: float | None = None
+        self._last_optical_flow: float | None = None
         self._trajectory_lock = threading.Lock()
         self._trajectory = SetpointTrajectoryGenerator()
         self._last_setpoint_time: float | None = None
@@ -941,6 +1084,8 @@ class MyLinkMavlinkClient:
         self._motor_output_logged = False
         self._custom_status_lock = threading.Lock()
         self._custom_status_frame: CustomActionStatusFrame | None = None
+        self._pressure_lock = threading.Lock()
+        self._pressure_detail_frame: PressureDetailFrame | None = None
 
     def start(self, timeout_s: float = 12.0) -> None:
         if self._connection is not None:
@@ -976,6 +1121,8 @@ class MyLinkMavlinkClient:
             self._motor_output_frame = None
         with self._custom_status_lock:
             self._custom_status_frame = None
+        with self._pressure_lock:
+            self._pressure_detail_frame = None
         self._threads = [
             threading.Thread(target=self._receive_loop, name="mylink-rx", daemon=True),
             threading.Thread(target=self._transmit_loop, name="mylink-tx", daemon=True),
@@ -1027,15 +1174,18 @@ class MyLinkMavlinkClient:
             heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
             local_age = None if self._last_local_position is None else now - self._last_local_position
             ground_age = None if self._last_ground_distance is None else now - self._last_ground_distance
+            optical_flow_age = None if self._last_optical_flow is None else now - self._last_optical_flow
             distances, top_age = self._top_distance_snapshot(now)
             motor_outputs, motor_age = self._motor_output_snapshot(now)
             custom_status, custom_age = self._custom_status_snapshot(now)
+            pressure_detail, pressure_age = self._pressure_detail_snapshot(now)
             return replace(
                 self._state,
                 connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
                 heartbeat_age_s=heartbeat_age,
                 local_position_age_s=local_age,
                 ground_distance_age_s=ground_age,
+                optical_flow_age_s=optical_flow_age,
                 top_distances_mm=distances,
                 top_distance_age_s=top_age,
                 motor_outputs_pwm_us=motor_outputs,
@@ -1046,6 +1196,16 @@ class MyLinkMavlinkClient:
                 custom_action_reason=None if custom_status is None else custom_status.reason,
                 custom_action_handover_id=0 if custom_status is None else custom_status.handover_id,
                 custom_action_age_s=custom_age,
+                pressure_target_gain=None if pressure_detail is None else pressure_detail.target_gain,
+                pressure_applied_gain=None if pressure_detail is None else pressure_detail.applied_gain,
+                pressure_progress=None if pressure_detail is None else pressure_detail.progress,
+                pressure_time_s=None if pressure_detail is None else pressure_detail.pressure_time_s,
+                pressure_trim_source=None if pressure_detail is None else pressure_detail.trim_source,
+                pressure_candidate_mask=0 if pressure_detail is None else pressure_detail.candidate_mask,
+                pressure_limiting_motor=0 if pressure_detail is None else pressure_detail.limiting_motor,
+                pressure_limited=False if pressure_detail is None else pressure_detail.limited,
+                pressure_complete=False if pressure_detail is None else pressure_detail.complete,
+                pressure_age_s=pressure_age,
                 rx_counts=tuple(sorted(self._rx_counts.items())),
                 tx_setpoints=self._setpoint_count,
             )
@@ -1071,14 +1231,19 @@ class MyLinkMavlinkClient:
         now = time.monotonic()
         heartbeat_age = None if self._last_heartbeat is None else now - self._last_heartbeat
         local_age = None if self._last_local_position is None else now - self._last_local_position
+        ground_age = None if self._last_ground_distance is None else now - self._last_ground_distance
+        optical_flow_age = None if self._last_optical_flow is None else now - self._last_optical_flow
         distances, top_age = self._top_distance_snapshot(now)
         motor_outputs, motor_age = self._motor_output_snapshot(now)
         custom_status, custom_age = self._custom_status_snapshot(now)
+        pressure_detail, pressure_age = self._pressure_detail_snapshot(now)
         return replace(
             self._state,
             connected=self._state.connected and heartbeat_age is not None and heartbeat_age <= HEARTBEAT_TIMEOUT_S,
             heartbeat_age_s=heartbeat_age,
             local_position_age_s=local_age,
+            ground_distance_age_s=ground_age,
+            optical_flow_age_s=optical_flow_age,
             top_distances_mm=distances,
             top_distance_age_s=top_age,
             motor_outputs_pwm_us=motor_outputs,
@@ -1089,6 +1254,16 @@ class MyLinkMavlinkClient:
             custom_action_reason=None if custom_status is None else custom_status.reason,
             custom_action_handover_id=0 if custom_status is None else custom_status.handover_id,
             custom_action_age_s=custom_age,
+            pressure_target_gain=None if pressure_detail is None else pressure_detail.target_gain,
+            pressure_applied_gain=None if pressure_detail is None else pressure_detail.applied_gain,
+            pressure_progress=None if pressure_detail is None else pressure_detail.progress,
+            pressure_time_s=None if pressure_detail is None else pressure_detail.pressure_time_s,
+            pressure_trim_source=None if pressure_detail is None else pressure_detail.trim_source,
+            pressure_candidate_mask=0 if pressure_detail is None else pressure_detail.candidate_mask,
+            pressure_limiting_motor=0 if pressure_detail is None else pressure_detail.limiting_motor,
+            pressure_limited=False if pressure_detail is None else pressure_detail.limited,
+            pressure_complete=False if pressure_detail is None else pressure_detail.complete,
+            pressure_age_s=pressure_age,
             rx_counts=tuple(sorted(self._rx_counts.items())),
             tx_setpoints=self._setpoint_count,
         )
@@ -1266,6 +1441,14 @@ class MyLinkMavlinkClient:
             timeout_s=3.0,
         )
 
+    def request_optical_flow_rate(self) -> CommandAck:
+        interval_us = round(1_000_000 / OPTICAL_FLOW_RATE_HZ)
+        return self.send_command_long(
+            mavlink2.MAV_CMD_SET_MESSAGE_INTERVAL,
+            [mavlink2.MAVLINK_MSG_ID_OPTICAL_FLOW_RAD, interval_us, 0, 0, 0, 0, 0],
+            timeout_s=3.0,
+        )
+
     def block_legacy_output(self) -> None:
         self._legacy_output_allowed = False
 
@@ -1397,6 +1580,45 @@ class MyLinkMavlinkClient:
             if frame.reason:
                 message += f"，原因：{CUSTOM_REASON_ZH[frame.reason]}"
             self.log(message)
+
+    def _pressure_detail_snapshot(
+        self, now: float
+    ) -> tuple[PressureDetailFrame | None, float | None]:
+        with self._pressure_lock:
+            frame = self._pressure_detail_frame
+        if frame is None:
+            return None, None
+        return frame, max(0.0, now - frame.received_at)
+
+    def _accept_pressure_detail_frame(self, frame: PressureDetailFrame, source: str) -> None:
+        with self._pressure_lock:
+            previous = self._pressure_detail_frame
+            if previous is not None and previous.sequence == frame.sequence:
+                return
+            self._pressure_detail_frame = frame
+
+        if previous is None:
+            self.log(f"[加压状态] 已通过 {source} 收到加压详情")
+        previous_candidate_mask = 0 if previous is None else previous.candidate_mask
+        new_candidate_mask = frame.candidate_mask & ~previous_candidate_mask
+        for candidate_bit, candidate_name in TRIM_CANDIDATE_ZH.items():
+            if new_candidate_mask & candidate_bit:
+                self.log(f"[加压状态] 电机基准候选已获取：{candidate_name}")
+        if frame.trim_source and (previous is None or previous.trim_source != frame.trim_source):
+            self.log(f"[加压状态] 当前采用电机基准：{TRIM_SOURCE_ZH[frame.trim_source]}")
+        if frame.limited and (previous is None or not previous.limited):
+            self.log(
+                f"[加压状态] M{frame.limiting_motor}达到输出上限，"
+                f"目标+{frame.target_gain * 100:.1f}%，实际+{frame.applied_gain * 100:.1f}%"
+            )
+        if frame.complete and (previous is None or not previous.complete):
+            if frame.limited:
+                self.log(
+                    f"[加压状态] 渐增时间完成，但受M{frame.limiting_motor}限幅，"
+                    f"实际+{frame.applied_gain * 100:.1f}%"
+                )
+            else:
+                self.log(f"[加压状态] 加压完成，实际+{frame.applied_gain * 100:.1f}%")
 
     def _lidar_receive_loop(self) -> None:
         while not self._stop.is_set():
@@ -1584,6 +1806,9 @@ class MyLinkMavlinkClient:
             custom_status_frame = decode_custom_action_status_mavlink(message, received_at=now)
             if custom_status_frame is not None:
                 self._accept_custom_status_frame(custom_status_frame, "MyLink MAVLink")
+            pressure_detail_frame = decode_pressure_detail_mavlink(message, received_at=now)
+            if pressure_detail_frame is not None:
+                self._accept_pressure_detail_frame(pressure_detail_frame, "MyLink MAVLink")
         if name == "HEARTBEAT" and (
             int(message.type) == mavlink2.MAV_TYPE_GCS
             or int(message.autopilot) == mavlink2.MAV_AUTOPILOT_INVALID
@@ -1638,6 +1863,12 @@ class MyLinkMavlinkClient:
                         self._state,
                         ground_distance_mm=ground_distance_mm,
                     )
+            elif name == "OPTICAL_FLOW_RAD":
+                self._last_optical_flow = now
+                self._state = replace(
+                    self._state,
+                    optical_flow_quality=max(0, min(int(message.quality), 255)),
+                )
             self._state_changed.notify_all()
         if name == "COMMAND_ACK":
             if (
@@ -1830,6 +2061,18 @@ class MyLinkController:
                     )
             except Exception as exc:
                 self.log.write(f"[警告] 离地高度刷新率请求失败，继续使用飞控默认频率：{exc}")
+            try:
+                optical_flow_rate_ack = client.request_optical_flow_rate()
+                if optical_flow_rate_ack.result == mavlink2.MAV_RESULT_ACCEPTED:
+                    self.log.write(
+                        f"[光流质量] 已请求{OPTICAL_FLOW_RATE_HZ:g} Hz光流数据流"
+                    )
+                else:
+                    self.log.write(
+                        f"[警告] 光流质量刷新率请求未被飞控接受：结果={optical_flow_rate_ack.result}"
+                    )
+            except Exception as exc:
+                self.log.write(f"[警告] 光流质量刷新率请求失败，继续使用飞控默认频率：{exc}")
             try:
                 save_successful_connection(client.connection_string)
                 self.log.write(f"[成功] 已保存UDP地址：{client.connection_string}")
@@ -2167,8 +2410,8 @@ class OffboardControlGuiV3:
             "forward": "前进", "back": "后退", "left": "左移", "right": "右移",
             "up": "上升", "down": "下降", "altitude": "起飞增量（m）", "distance": "移动步长（m）",
             "status_row": "状态", "position_row": "当前位置", "velocity_row": "当前速度",
-            "custom_status_row": "触顶流程", "battery_row": "电池", "top_distance_row": "顶部距离",
-            "ground_distance_row": "离地高度",
+            "custom_status_row": "触顶流程", "pressure_status_row": "加压状态", "battery_row": "电池", "top_distance_row": "顶部距离",
+            "ground_distance_row": "离地高度", "optical_flow_quality_row": "光流质量",
             "motor_output_row": "电机PWM输出",
             "target_row": "最终目标", "command_row": "当前指令",
             "connected": "已连接", "disconnected": "未连接", "system": "系统ID", "component": "组件ID",
@@ -2184,8 +2427,9 @@ class OffboardControlGuiV3:
             "back": "BACK", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
             "altitude": "Takeoff increment (m)", "distance": "Movement step (m)",
             "status_row": "State", "position_row": "Position", "velocity_row": "Velocity",
-            "custom_status_row": "Top-contact process", "battery_row": "Battery",
+            "custom_status_row": "Top-contact process", "pressure_status_row": "Pressure status", "battery_row": "Battery",
             "top_distance_row": "Top distance", "ground_distance_row": "Height above ground",
+            "optical_flow_quality_row": "Optical flow quality",
             "motor_output_row": "Motor PWM output",
             "target_row": "Final target", "command_row": "Command",
             "connected": "CONNECTED", "disconnected": "DISCONNECTED", "system": "SYS", "component": "COMP",
@@ -2210,16 +2454,19 @@ class OffboardControlGuiV3:
         self.distance_var = tk.StringVar(value="0.5")
         self.status_var = tk.StringVar(value=self.tr("disconnected"))
         self.custom_status_var = tk.StringVar(value="—")
+        self.pressure_status_var = tk.StringVar(value="—")
         self.position_var = tk.StringVar(value="N —  E —  D —")
         self.velocity_var = tk.StringVar(value="vx —  vy —  vz —")
         self.battery_var = tk.StringVar(value="—")
         self.top_distance_var = tk.StringVar(value="左上 —  右上 —  左下 —  右下 — mm")
         self.ground_distance_var = tk.StringVar(value="— mm")
-        self.motor_output_vars = tuple(tk.DoubleVar(value=0.0) for _ in range(4))
+        self.optical_flow_quality_var = tk.StringVar(value="—")
         self.motor_output_text_vars = tuple(tk.StringVar(value=f"M{index + 1} —") for index in range(4))
+        self._motor_display_normalized: list[float | None] = [None, None, None, None]
         self.motor_output_age_var = tk.StringVar(value="age=—s")
         self.target_var = tk.StringVar(value="N —  E —  D —")
         self.command_var = tk.StringVar(value="N —  E —  D — | v —")
+        self._optical_flow_level: str | None = None
         self._closing = False
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -2254,6 +2501,10 @@ class OffboardControlGuiV3:
         style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         style.configure("Motor.Valid.Horizontal.TProgressbar", troughcolor="#d9d9d9", background="#2eaf5d")
         style.configure("Motor.Stale.Horizontal.TProgressbar", troughcolor="#d9d9d9", background="#9e9e9e")
+        style.configure("Flow.Good.TLabel", foreground="#17823b", font=("Consolas", 10, "bold"))
+        style.configure("Flow.Fair.TLabel", foreground="#b36b00", font=("Consolas", 10, "bold"))
+        style.configure("Flow.Poor.TLabel", foreground="#cf2525", font=("Consolas", 10, "bold"))
+        style.configure("Flow.Stale.TLabel", foreground="#7f7f7f", font=("Consolas", 10))
         root.columnconfigure(0, weight=1)
         root.columnconfigure(1, weight=1)
         root.rowconfigure(2, weight=1)
@@ -2285,39 +2536,50 @@ class OffboardControlGuiV3:
         for row, (name, variable) in enumerate((
             (self.tr("status_row"), self.status_var),
             (self.tr("custom_status_row"), self.custom_status_var),
+            (self.tr("pressure_status_row"), self.pressure_status_var),
             (self.tr("position_row"), self.position_var),
             (self.tr("velocity_row"), self.velocity_var),
             (self.tr("battery_row"), self.battery_var),
             (self.tr("top_distance_row"), self.top_distance_var),
             (self.tr("ground_distance_row"), self.ground_distance_var),
+            (self.tr("optical_flow_quality_row"), self.optical_flow_quality_var),
         )):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
-        ttk.Label(status, text=self.tr("motor_output_row") + ":", width=16).grid(row=7, column=0, sticky="nw", pady=2)
+            value_label = ttk.Label(status, textvariable=variable, font=("Consolas", 10))
+            value_label.grid(row=row, column=1, sticky="w", pady=2)
+            if variable is self.optical_flow_quality_var:
+                self.optical_flow_quality_label = value_label
+                value_label.configure(style="Flow.Stale.TLabel")
+        ttk.Label(status, text=self.tr("motor_output_row") + ":", width=16).grid(row=9, column=0, sticky="nw", pady=2)
         motor_frame = ttk.Frame(status)
-        motor_frame.grid(row=7, column=1, sticky="ew", pady=2)
+        motor_frame.grid(row=9, column=1, sticky="ew", pady=2)
         status.columnconfigure(1, weight=1)
-        self.motor_progressbars: list[ttk.Progressbar] = []
+        self.motor_progressbars: list[tk.Canvas] = []
         for motor_index in range(4):
             motor_frame.columnconfigure(motor_index, weight=1)
             cell = ttk.Frame(motor_frame)
             cell.grid(row=0, column=motor_index, sticky="ew", padx=(0, 8))
             ttk.Label(cell, textvariable=self.motor_output_text_vars[motor_index], font=("Consolas", 9)).grid(row=0, column=0, sticky="w")
-            progress = ttk.Progressbar(
+            progress = tk.Canvas(
                 cell,
-                maximum=MOTOR_PWM_DISPLAY_RANGE_US,
-                variable=self.motor_output_vars[motor_index],
-                style="Motor.Stale.Horizontal.TProgressbar",
-                length=135,
+                width=135,
+                height=18,
+                background="#d9d9d9",
+                borderwidth=0,
+                highlightthickness=0,
             )
             progress.grid(row=1, column=0, sticky="ew")
             cell.columnconfigure(0, weight=1)
             self.motor_progressbars.append(progress)
+            progress.bind(
+                "<Configure>",
+                lambda _event, index=motor_index: self._draw_motor_output_bar(index),
+            )
         ttk.Label(motor_frame, textvariable=self.motor_output_age_var, font=("Consolas", 9)).grid(row=0, column=4, rowspan=2, sticky="w")
         for row, (name, variable) in enumerate((
             (self.tr("target_row"), self.target_var),
             (self.tr("command_row"), self.command_var),
-        ), start=8):
+        ), start=10):
             ttk.Label(status, text=name + ":", width=10).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(status, textvariable=variable, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
 
@@ -2413,6 +2675,120 @@ class OffboardControlGuiV3:
             detail += f" | handover={state.custom_action_handover_id}"
         return detail if self.language == "zh" else f"{detail} | age={age:.2f}s"
 
+    def _format_pressure_status(self, state: MyLinkState) -> str:
+        if state.custom_action_state == 6:
+            return "等待电机基准稳定" if self.language == "zh" else "WAITING FOR MOTOR TRIM MATCH"
+        if state.custom_action_state == 5:
+            return "等待加压控制接管" if self.language == "zh" else "WAITING FOR PRESSURE CONTROL"
+        if state.custom_action_reason == 9:
+            return "加压控制接管超时" if self.language == "zh" else "PRESSURE CONTROL TIMEOUT"
+        if state.custom_action_reason == 10:
+            return "电机基准匹配超时" if self.language == "zh" else "MOTOR TRIM MATCH TIMEOUT"
+
+        age = state.pressure_age_s
+        if age is None:
+            return "—"
+        if age > PRESSURE_DETAIL_STALE_S:
+            return "加压状态数据中断" if self.language == "zh" else "PRESSURE DATA STALE"
+
+        source_id = state.pressure_trim_source or 0
+        if state.custom_action_state in (1, 2, 3):
+            if self.language == "zh":
+                return (
+                    "正在采集电机基准"
+                    if source_id == 0
+                    else f"当前采用电机基准：{TRIM_SOURCE_ZH[source_id]}"
+                )
+            return (
+                "COLLECTING MOTOR TRIM"
+                if source_id == 0
+                else f"MOTOR TRIM: {TRIM_SOURCE_NAMES[source_id]}"
+            )
+
+        if state.custom_action_state != 4:
+            return "等待触顶" if self.language == "zh" else "WAITING FOR TOP CONTACT"
+
+        target = (state.pressure_target_gain or 0.0) * 100.0
+        applied = (state.pressure_applied_gain or 0.0) * 100.0
+        progress = (state.pressure_progress or 0.0) * 100.0
+        target_time = state.pressure_time_s or 0.0
+        elapsed_time = target_time * progress / 100.0
+        motor = state.pressure_limiting_motor
+
+        if self.language == "zh":
+            if state.pressure_complete and state.pressure_limited:
+                return f"加压受限｜{target_time:.1f}s完成｜目标 +{target:.1f}%｜实际 +{applied:.1f}%｜M{motor}达到上限"
+            if state.pressure_complete:
+                return f"贴顶加压完成｜用时 {target_time:.1f}s｜实际 +{applied:.1f}%"
+            detail = (
+                f"贴顶加压中 {elapsed_time:.1f}/{target_time:.1f}s（{progress:.0f}%）"
+                f"｜目标 +{target:.1f}%｜实际 +{applied:.1f}%"
+            )
+            if state.pressure_limited:
+                detail += f"｜M{motor}已限幅"
+            return detail
+
+        if state.pressure_complete and state.pressure_limited:
+            return f"PRESSURE LIMITED | {target_time:.1f}s | target +{target:.1f}% | actual +{applied:.1f}% | M{motor} limit"
+        if state.pressure_complete:
+            return f"PRESSURE COMPLETE | {target_time:.1f}s | actual +{applied:.1f}%"
+        detail = (
+            f"PRESSURIZING {elapsed_time:.1f}/{target_time:.1f}s ({progress:.0f}%)"
+            f" | target +{target:.1f}% | actual +{applied:.1f}%"
+        )
+        if state.pressure_limited:
+            detail += f" | M{motor} limited"
+        return detail
+
+    def _update_optical_flow_quality(self, state: MyLinkState) -> None:
+        age = state.optical_flow_age_s
+        if state.optical_flow_quality is None or age is None or age > OPTICAL_FLOW_STALE_S:
+            if self._optical_flow_level is not None:
+                self.log.write("[光流质量] 数据中断")
+            self._optical_flow_level = None
+            self.optical_flow_quality_var.set(
+                "—（数据中断）" if self.language == "zh" else "— (DATA STALE)"
+            )
+            self.optical_flow_quality_label.configure(style="Flow.Stale.TLabel")
+            return
+
+        quality = max(0, min(int(state.optical_flow_quality), 255))
+        level = optical_flow_quality_level(quality, self._optical_flow_level)
+        if level != self._optical_flow_level:
+            level_zh = {"poor": "较差", "fair": "一般", "good": "良好"}[level]
+            self.log.write(f"[光流质量] {level_zh}：{quality}/255")
+        self._optical_flow_level = level
+        if self.language == "zh":
+            level_text = {"poor": "较差", "fair": "一般", "good": "良好"}[level]
+        else:
+            level_text = {"poor": "POOR", "fair": "FAIR", "good": "GOOD"}[level]
+        self.optical_flow_quality_var.set(
+            f"{quality}/255（{level_text}） | age={self._fmt(age)}s"
+        )
+        style_name = {"poor": "Flow.Poor.TLabel", "fair": "Flow.Fair.TLabel", "good": "Flow.Good.TLabel"}[level]
+        self.optical_flow_quality_label.configure(style=style_name)
+
+    def _draw_motor_output_bar(self, motor_index: int) -> None:
+        """Draw the bar and its value on one canvas so the text has no background."""
+        canvas = self.motor_progressbars[motor_index]
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 18)
+        normalized = self._motor_display_normalized[motor_index]
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#d9d9d9", outline="")
+
+        if normalized is None:
+            canvas.create_text(width / 2, height / 2, text="—", fill="#6f6f6f", font=("Consolas", 9, "bold"))
+            return
+
+        normalized = min(max(normalized, 0.0), 1.0)
+        canvas.create_rectangle(0, 0, width * normalized, height, fill="#2eaf5d", outline="")
+        value_text = f"{normalized:.3f}"
+        # A one-pixel shadow keeps the transparent text readable over both the
+        # green filled area and the grey unfilled area.
+        canvas.create_text(width / 2 + 1, height / 2 + 1, text=value_text, fill="#303030", font=("Consolas", 9, "bold"))
+        canvas.create_text(width / 2, height / 2, text=value_text, fill="#ffffff", font=("Consolas", 9, "bold"))
+
     def _refresh(self) -> None:
         if self._closing:
             return
@@ -2426,6 +2802,7 @@ class OffboardControlGuiV3:
             f"{self.tr('heartbeat')}={self._fmt(state.heartbeat_age_s)}s"
         )
         self.custom_status_var.set(self._format_custom_status(state))
+        self.pressure_status_var.set(self._format_pressure_status(state))
         self.position_var.set(
             f"{self.tr('north')} {self._fmt(state.x)}  {self.tr('east')} {self._fmt(state.y)}  "
             f"{self.tr('down_axis')} {self._fmt(state.z)}"
@@ -2452,19 +2829,18 @@ class OffboardControlGuiV3:
             f"{self._fmt_mm(state.ground_distance_mm)} mm | "
             f"age={self._fmt(state.ground_distance_age_s)}s"
         )
+        self._update_optical_flow_quality(state)
         motor_stale = state.motor_output_age_s is None or state.motor_output_age_s > MOTOR_OUTPUT_STALE_S
         for motor_index, output in enumerate(state.motor_outputs_pwm_us):
-            progress = self.motor_progressbars[motor_index]
             if motor_stale or output is None:
-                self.motor_output_vars[motor_index].set(0.0)
                 self.motor_output_text_vars[motor_index].set(f"M{motor_index + 1} —")
-                progress.configure(style="Motor.Stale.Horizontal.TProgressbar")
+                self._motor_display_normalized[motor_index] = None
             else:
                 pwm_us = int(output)
-                display_pwm = min(max(pwm_us, MOTOR_PWM_DISPLAY_MIN_US), MOTOR_PWM_DISPLAY_MAX_US)
-                self.motor_output_vars[motor_index].set(display_pwm - MOTOR_PWM_DISPLAY_MIN_US)
+                normalized = motor_pwm_to_normalized(pwm_us)
                 self.motor_output_text_vars[motor_index].set(f"M{motor_index + 1} {pwm_us} μs")
-                progress.configure(style="Motor.Valid.Horizontal.TProgressbar")
+                self._motor_display_normalized[motor_index] = normalized
+            self._draw_motor_output_bar(motor_index)
         self.motor_output_age_var.set(f"age={self._fmt(state.motor_output_age_s)}s")
         target = self.controller.target
         axes = (self.tr("north"), self.tr("east"), self.tr("down_axis"))
@@ -2549,6 +2925,11 @@ def self_test() -> None:
         mavlink2.MAV_SENSOR_ROTATION_PITCH_270, 0,
     )
     assert decode_ground_distance_mavlink(mavlink_ground_distance) == 1230
+    assert optical_flow_quality_level(49) == "poor"
+    assert optical_flow_quality_level(50) == "fair"
+    assert optical_flow_quality_level(100) == "good"
+    assert optical_flow_quality_level(96, "good") == "good"
+    assert optical_flow_quality_level(94, "good") == "fair"
     motor_metadata = (
         MOTOR_OUTPUT_ARRAY_MARKER
         | MOTOR_OUTPUT_ARRAY_VERSION
@@ -2561,7 +2942,17 @@ def self_test() -> None:
     motor_frame = decode_motor_output_mavlink(mavlink_motor, received_at=3.0)
     assert motor_frame is not None and motor_frame.armed
     assert motor_frame.sequence == 9 and motor_frame.outputs_pwm_us == (1000, 1250, 1742, 1900)
+    assert math.isclose(motor_pwm_to_normalized(1000), 0.0)
+    assert math.isclose(motor_pwm_to_normalized(1950), 0.95)
+    assert math.isclose(motor_pwm_to_normalized(2000), 1.0)
     monitor = MyLinkMavlinkClient("udp:127.0.0.1:14540")
+    mavlink_flow = mavlink2.MAVLink(None).optical_flow_rad_encode(
+        123456, 0, 15872, 0.01, -0.02, 0.0, 0.0, 0.0, 2500, 125, 0, 1.2,
+    )
+    monitor._handle_message(mavlink_flow)
+    flow_state = monitor.snapshot()
+    assert flow_state.optical_flow_quality == 125
+    assert flow_state.optical_flow_age_s is not None and flow_state.optical_flow_age_s < 0.1
     assert monitor.ground_standby()
     monitor.set_ground_standby(False)
     assert not monitor.ground_standby()
@@ -2586,6 +2977,29 @@ def self_test() -> None:
     monitor._accept_custom_status_frame(custom_status, "self-test")
     stored_status, stored_age = monitor._custom_status_snapshot(4.2)
     assert stored_status == custom_status and math.isclose(stored_age, 0.2)
+    pressure_metadata = (
+        PRESSURE_DETAIL_MARKER
+        | PRESSURE_DETAIL_VERSION
+        | (3 << PRESSURE_DETAIL_TRIM_SOURCE_SHIFT)
+        | (7 << PRESSURE_DETAIL_CANDIDATE_SHIFT)
+        | (4 << PRESSURE_DETAIL_LIMITING_MOTOR_SHIFT)
+        | PRESSURE_DETAIL_LIMITED_FLAG
+        | PRESSURE_DETAIL_VALID_FLAG
+        | 12
+    )
+    packed_pressure = 3000 | (520 << 16) | (667 << 32) | (3000 << 48)
+    mavlink_pressure = mavlink2.MAVLink(None).ping_encode(
+        packed_pressure, pressure_metadata, SOURCE_SYSTEM, SOURCE_COMPONENT
+    )
+    pressure = decode_pressure_detail_mavlink(mavlink_pressure, received_at=5.0)
+    assert pressure is not None
+    assert pressure.sequence == 12 and pressure.trim_source == 3 and pressure.candidate_mask == 7
+    assert pressure.limited and pressure.limiting_motor == 4 and not pressure.complete
+    assert math.isclose(pressure.target_gain, 0.30) and math.isclose(pressure.applied_gain, 0.052)
+    assert math.isclose(pressure.progress, 0.667) and math.isclose(pressure.pressure_time_s, 3.0)
+    monitor._accept_pressure_detail_frame(pressure, "self-test")
+    stored_pressure, pressure_age = monitor._pressure_detail_snapshot(5.2)
+    assert stored_pressure == pressure and math.isclose(pressure_age, 0.2)
     controller_names = set(dir(MyLinkController))
     assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
     assert "simulate_laser_signal" not in controller_names
@@ -2603,7 +3017,7 @@ def self_test() -> None:
     assert "_send_pending_top_distances" not in source
     assert sitl_mylink_connection("udp:127.0.0.1:14540") == "udpout:127.0.0.1:14541"
     assert sitl_mylink_connection("udp:192.168.1.10:14540") is None
-    print("GUI V3 self-test: UDP API, top/ground distance, motor PWM/top-state monitoring, CUSTOM1 and rebase helpers OK; no connection opened")
+    print("GUI V3 self-test: UDP API, top/ground/optical-flow data, motor PWM/top-state/pressure monitoring, CUSTOM1 and rebase helpers OK; no connection opened")
 
 
 def main() -> None:
