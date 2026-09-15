@@ -1576,6 +1576,15 @@ class MyLinkMavlinkClient:
         )
         current_key = (CUSTOM_STATE_ZH.get(frame.state), frame.reason, frame.active)
         if current_key != previous_key:
+            if frame.active and frame.state == 6 and (previous is None or previous.state != 6):
+                self.log(
+                    "[电机基准] 开始比较：当前四电机输出比例需与采集基准"
+                    "连续稳定250 ms，最长等待1秒"
+                )
+            elif previous is not None and previous.state == 6 and frame.active and frame.state in (4, 5):
+                self.log("[电机基准] 比较成功，正在进入贴顶加压")
+            elif not frame.active and frame.reason == 10:
+                self.log("[电机基准] 比较失败：当前输出与采集基准不匹配，未进入加压")
             message = f"[贴顶流程] {CUSTOM_STATE_ZH[frame.state]}"
             if frame.reason:
                 message += f"，原因：{CUSTOM_REASON_ZH[frame.reason]}"
@@ -1605,7 +1614,7 @@ class MyLinkMavlinkClient:
             if new_candidate_mask & candidate_bit:
                 self.log(f"[加压状态] 电机基准候选已获取：{candidate_name}")
         if frame.trim_source and (previous is None or previous.trim_source != frame.trim_source):
-            self.log(f"[加压状态] 当前采用电机基准：{TRIM_SOURCE_ZH[frame.trim_source]}")
+            self.log(f"[电机基准] 采集成功，采用：{TRIM_SOURCE_ZH[frame.trim_source]}")
         if frame.limited and (previous is None or not previous.limited):
             self.log(
                 f"[加压状态] M{frame.limiting_motor}达到输出上限，"
@@ -1913,9 +1922,9 @@ class MyLinkMavlinkClient:
             with self._project_lock:
                 response_to_request = ack.project_request_id in self._outstanding_project_requests
             if response_to_request:
-                self.log("[贴顶流程] 正在恢复上位机控制")
+                self.log("[控制交接] 正在恢复当前位置控制")
                 return
-            self.log("[贴顶流程] 正在恢复上位机控制")
+            self.log("[控制交接] 正在恢复当前位置控制")
             threading.Thread(
                 target=self._complete_handover,
                 args=(ack.project_request_id,),
@@ -2369,6 +2378,10 @@ class MyLinkController:
     def search_top_active(self) -> bool:
         return self.client is not None and self.client.search_top_active()
 
+    def takeoff_active(self) -> bool:
+        """Return whether the GUI's generated takeoff trajectory is active."""
+        return self.client is not None and self.client.takeoff_active()
+
     def close(self) -> None:
         if self.client is not None:
             self.client.close()
@@ -2588,6 +2601,7 @@ class OffboardControlGuiV3:
         for column in range(3):
             control.columnconfigure(column, weight=1)
         self.action_buttons: list[ttk.Button] = []
+        self.custom_button: ttk.Button | None = None
         top_actions = (
             ("takeoff", lambda: self.controller.takeoff(self.altitude_var.get())),
             ("land", self.controller.land),
@@ -2597,6 +2611,8 @@ class OffboardControlGuiV3:
             button = ttk.Button(control, text=self.tr(key), command=lambda k=key, a=action: self.controller.submit(k.upper(), a))
             button.grid(row=0, column=column, sticky="ew", padx=3, pady=3)
             self.action_buttons.append(button)
+            if key == "custom":
+                self.custom_button = button
         ttk.Label(control, text=self.tr("altitude")).grid(row=1, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(control, textvariable=self.altitude_var, width=8).grid(row=1, column=1, sticky="w")
         ttk.Label(control, text=self.tr("distance")).grid(row=2, column=0, sticky="w", pady=(10, 3))
@@ -2864,6 +2880,12 @@ class OffboardControlGuiV3:
         self.disconnect_button.configure(state="normal" if connected and not busy else "disabled")
         for button in self.action_buttons:
             button.configure(state="normal" if connected and not busy else "disabled")
+        # Do not let the operator request top search while the GUI is still
+        # producing the takeoff trajectory. The controller-side check remains
+        # as a final guard against a click/refresh race.
+        if self.custom_button is not None:
+            custom_enabled = connected and not busy and not self.controller.takeoff_active()
+            self.custom_button.configure(state="normal" if custom_enabled else "disabled")
         self.root.after(200, self._refresh)
 
     def _restore_events(self) -> None:
@@ -3001,7 +3023,10 @@ def self_test() -> None:
     stored_pressure, pressure_age = monitor._pressure_detail_snapshot(5.2)
     assert stored_pressure == pressure and math.isclose(pressure_age, 0.2)
     controller_names = set(dir(MyLinkController))
-    assert {"takeoff", "descend", "move", "land", "custom", "sync_target_to_mode"} <= controller_names
+    assert {
+        "takeoff", "takeoff_active", "descend", "move", "land", "custom",
+        "sync_target_to_mode",
+    } <= controller_names
     assert "simulate_laser_signal" not in controller_names
     source = Path(__file__).read_text(encoding="utf-8").split("def self_test()", 1)[0]
     assert "class FlightPhase" not in source
