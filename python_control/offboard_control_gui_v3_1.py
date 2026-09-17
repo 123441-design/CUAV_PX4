@@ -1614,7 +1614,7 @@ class MyLinkMavlinkClient:
             if new_candidate_mask & candidate_bit:
                 self.log(f"[加压状态] 电机基准候选已获取：{candidate_name}")
         if frame.trim_source and (previous is None or previous.trim_source != frame.trim_source):
-            self.log(f"[电机基准] 采集成功，采用：{TRIM_SOURCE_ZH[frame.trim_source]}")
+            self.log(f"[电机基准] 采集成功：{TRIM_SOURCE_ZH[frame.trim_source]}（等输出加压不使用基准比例）")
         if frame.limited and (previous is None or not previous.limited):
             self.log(
                 f"[加压状态] M{frame.limiting_motor}达到输出上限，"
@@ -2713,7 +2713,7 @@ class OffboardControlGuiV3:
                 return (
                     "正在采集电机基准"
                     if source_id == 0
-                    else f"当前采用电机基准：{TRIM_SOURCE_ZH[source_id]}"
+                    else f"基准已采集：{TRIM_SOURCE_ZH[source_id]}"
                 )
             return (
                 "COLLECTING MOTOR TRIM"
@@ -2735,9 +2735,9 @@ class OffboardControlGuiV3:
             if state.pressure_complete and state.pressure_limited:
                 return f"加压受限｜{target_time:.1f}s完成｜目标 +{target:.1f}%｜实际 +{applied:.1f}%｜M{motor}达到上限"
             if state.pressure_complete:
-                return f"贴顶加压完成｜用时 {target_time:.1f}s｜实际 +{applied:.1f}%"
+                return f"四电机等输出保持中｜{target_time:.1f}s达到配置上限"
             detail = (
-                f"贴顶加压中 {elapsed_time:.1f}/{target_time:.1f}s（{progress:.0f}%）"
+                f"四电机等输出加压中 {elapsed_time:.1f}/{target_time:.1f}s（{progress:.0f}%）"
                 f"｜目标 +{target:.1f}%｜实际 +{applied:.1f}%"
             )
             if state.pressure_limited:

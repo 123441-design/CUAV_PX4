@@ -200,6 +200,7 @@ private:
 		(ParamFloat<px4::params::CUST_TRIM_TMAX>) _param_trim_time_max,
 		(ParamFloat<px4::params::CUST_TRIM_ANG>) _param_trim_angle,
 		(ParamFloat<px4::params::CUST_TRIM_RATE>) _param_trim_rate,
+		(ParamFloat<px4::params::CUST_TRIM_TOL>) _param_trim_tolerance,
 		(ParamFloat<px4::params::CUST_PRS_GAIN>) _param_press_gain,
 		(ParamFloat<px4::params::CUST_PRS_TIME>) _param_press_time,
 		(ParamFloat<px4::params::CUST_MOT_LIM>) _param_motor_limit,

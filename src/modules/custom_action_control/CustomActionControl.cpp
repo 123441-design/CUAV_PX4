@@ -35,7 +35,6 @@ constexpr hrt_abstime kPressMotorBlendTime = 300_ms;
 constexpr float kMotorTrimFilterTimeConstant = 0.4f;
 constexpr float kTrimLooseLimitMultiplier = 2.f;
 constexpr float kTrimRetreatDistance = 0.15f;
-constexpr float kMotorTrimMatchRelativeTolerance = 0.20f;
 constexpr float kMotorTrimMatchAbsoluteFloor = 0.015f;
 constexpr uint8_t kMinimumMotorCount = 4;
 constexpr uint8_t kContactThresholdFramesRequired = 3;
@@ -527,7 +526,7 @@ bool CustomActionControl::motorTrimMatchesCurrent(hrt_abstime now) const
 		if (_motor_trim_mask & (1u << i)) {
 			const float expected = _motor_trim[i] * collective_scale;
 			const float tolerance = math::max(kMotorTrimMatchAbsoluteFloor,
-							  expected * kMotorTrimMatchRelativeTolerance);
+							  expected * _param_trim_tolerance.get());
 
 			if (fabsf(_allocated_motors.control[i] - expected) > tolerance) {
 				return false;
@@ -613,20 +612,19 @@ bool CustomActionControl::preparePressHandover(hrt_abstime now)
 	}
 
 	uint8_t motor_count = 0;
-	float alignment_scale = 1.f;
+	float common_start = 0.f;
+	const float motor_limit = math::constrain(_param_motor_limit.get(), 0.5f, 1.f);
 
 	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
 		if (_motor_trim_mask & (1u << i)) {
-			const float filtered_trim = _motor_trim[i];
 			const float current_output = _allocated_motors.control[i];
 
-			if (!PX4_ISFINITE(filtered_trim) || filtered_trim <= FLT_EPSILON
-			    || !PX4_ISFINITE(current_output) || current_output <= FLT_EPSILON
-			    || current_output > _param_motor_limit.get()) {
+			if (!PX4_ISFINITE(current_output) || current_output <= FLT_EPSILON
+			    || current_output > motor_limit) {
 				return false;
 			}
 
-			alignment_scale = math::max(alignment_scale, current_output / filtered_trim);
+			common_start = math::max(common_start, current_output);
 			++motor_count;
 		}
 	}
@@ -636,35 +634,15 @@ bool CustomActionControl::preparePressHandover(hrt_abstime now)
 	}
 
 	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
-		if (_motor_trim_mask & (1u << i)) {
-			const float current_output = _allocated_motors.control[i];
-			const float aligned_filtered_output = _motor_trim[i] * alignment_scale;
-
-			// A common scale preserves the filtered motor ratios. Choosing the
-			// largest current/trim ratio guarantees that the 300 ms blend never
-			// asks any individual motor to decrease.
-			if (!PX4_ISFINITE(aligned_filtered_output)
-			    || aligned_filtered_output + FLT_EPSILON < current_output
-			    || aligned_filtered_output > _param_motor_limit.get()) {
-				return false;
-			}
-
-			_press_entry_output[i] = current_output;
-			_press_base_output[i] = aligned_filtered_output;
-
-		} else {
-			_press_entry_output[i] = 0.f;
-			_press_base_output[i] = 0.f;
-		}
+		// Keep trim collection/matching intact, but do not replay trim ratios
+		// during equal-output pressure. The highest entry output avoids a drop.
+		_press_entry_output[i] = (_motor_trim_mask & (1u << i)) ? common_start : 0.f;
+		_press_base_output[i] = _press_entry_output[i];
 	}
 
 	_press_output_mask = _motor_trim_mask;
-	PX4_INFO("[CONTACT_PRESS] filtered handover source=%s scale=%.3f entry=(%.3f %.3f %.3f %.3f) base=(%.3f %.3f %.3f %.3f)",
-		 motorTrimSourceName(_motor_trim_source), (double)alignment_scale,
-		 (double)_press_entry_output[0], (double)_press_entry_output[1],
-		 (double)_press_entry_output[2], (double)_press_entry_output[3],
-		 (double)_press_base_output[0], (double)_press_base_output[1],
-		 (double)_press_base_output[2], (double)_press_base_output[3]);
+	PX4_INFO("[CONTACT_PRESS] equal-output handover start=%.3f target=%.3f ramp=300 ms",
+		 (double)common_start, (double)motor_limit);
 	return true;
 }
 
@@ -674,88 +652,78 @@ void CustomActionControl::publishDirectMotorSetpoint(hrt_abstime now)
 		return;
 	}
 
+	const float motor_limit = math::constrain(_param_motor_limit.get(), 0.5f, 1.f);
 	const bool takeover_start = _press_output_started == 0;
 
 	if (takeover_start) {
+		float common_start = 0.f;
+
+		for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+			if (_press_output_mask & (1u << i)) {
+				common_start = math::max(common_start, _press_entry_output[i]);
+
+				// Include the latest allocator sample before direct mode takes over.
+				if (_allocated_motors.timestamp != 0 && now >= _allocated_motors.timestamp
+				    && now - _allocated_motors.timestamp <= kActuatorTimeout) {
+					const float current_output = _allocated_motors.control[i];
+
+					if (!PX4_ISFINITE(current_output) || current_output <= FLT_EPSILON
+					    || current_output > motor_limit) {
+						beginHandover(custom_action_status_s::REASON_ACTUATOR_TIMEOUT, _active_request_id,
+							      _active_source_system, _active_source_component, true);
+						return;
+					}
+
+					common_start = math::max(common_start, current_output);
+				}
+			}
+		}
+
+		for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+			if (_press_output_mask & (1u << i)) {
+				_press_entry_output[i] = common_start;
+				_press_base_output[i] = common_start;
+			}
+		}
+
 		_press_output_started = now;
-		PX4_INFO("[CONTACT_PRESS] direct actuator ready; starting monotonic 300 ms filtered-trim blend");
-	}
-
-	const hrt_abstime blend_elapsed_us = now >= _press_output_started ? now - _press_output_started : 0;
-	const float blend_progress = math::constrain(static_cast<float>(blend_elapsed_us)
-				     / static_cast<float>(kPressMotorBlendTime), 0.f, 1.f);
-	const bool pressure_ramp_start = blend_progress >= 1.f
-					 && _state == custom_action_status_s::STATE_CONTACT_PRESS_WAIT;
-
-	if (pressure_ramp_start) {
+		_pressure_ramp_started = now;
 		_state = custom_action_status_s::STATE_CONTACT_PRESS;
 		_reason = custom_action_status_s::REASON_NONE;
-		_pressure_ramp_started = now;
-		PX4_INFO("[CONTACT_PRESS] filtered-trim blend complete; pressure ramp active");
+		PX4_INFO("[CONTACT_PRESS] direct equal-output ramp active start=%.3f target=%.3f",
+			 (double)common_start, (double)motor_limit);
 	}
 
-	const float pressure_elapsed = _pressure_ramp_started != 0 && now >= _pressure_ramp_started
-				       ? static_cast<float>(now - _pressure_ramp_started) * 1e-6f
-				       : 0.f;
+	const hrt_abstime elapsed_us = now >= _pressure_ramp_started ? now - _pressure_ramp_started : 0;
+	const float progress = math::constrain(static_cast<float>(elapsed_us)
+			       / static_cast<float>(kPressMotorBlendTime), 0.f, 1.f);
+	float common_start = 0.f;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_press_output_mask & (1u << i)) {
+			common_start = math::max(common_start, _press_entry_output[i]);
+		}
+	}
+
+	const float common_output = math::constrain(common_start + progress * (motor_limit - common_start),
+				    0.f, motor_limit);
+	_active_pressure_gain = common_start > FLT_EPSILON ? math::max(common_output / common_start - 1.f, 0.f) : 0.f;
+	_pressure_ramp_complete = progress >= 1.f;
+	_motor_output_limited = false;
+	_limiting_motor = 0;
+
 	actuator_motors_s motors{};
 	motors.timestamp = now;
 	motors.timestamp_sample = now;
 	motors.reversible_flags = 0;
 
-	const float target_time_s = math::max(_param_press_time.get(), 0.2f);
-	const float pressure_progress = math::constrain(pressure_elapsed / target_time_s, 0.f, 1.f);
-	const float requested_gain = math::max(_param_press_gain.get(), 0.f) * pressure_progress;
-	const float requested_scale = 1.f + requested_gain;
-	float scale = requested_scale;
-	const float motor_limit = _param_motor_limit.get();
-	uint8_t limiting_motor = 0;
-
 	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
-		if ((_press_output_mask & (1u << i)) && _press_base_output[i] > FLT_EPSILON) {
-			const float motor_scale_limit = motor_limit / _press_base_output[i];
-
-			if (motor_scale_limit < scale) {
-				scale = motor_scale_limit;
-				limiting_motor = static_cast<uint8_t>(i + 1);
-			}
-		}
-	}
-
-	// Never let any motor fall below its contact baseline. Keeping the scale at
-	// least the previously applied value also makes the ramp monotonic if a
-	// parameter changes while pressure mode is active.
-	scale = math::max(scale, 1.f + _active_pressure_gain);
-	_active_pressure_gain = math::max(scale - 1.f, 0.f);
-	const bool output_limited = scale + FLT_EPSILON < requested_scale;
-	_pressure_ramp_complete = pressure_progress >= 1.f;
-	_limiting_motor = output_limited ? limiting_motor : 0;
-
-	if (output_limited != _motor_output_limited) {
-		if (output_limited) {
-			PX4_WARN("[CONTACT_PRESS] motor %u limit active requested=%.3f applied=%.3f",
-				 (unsigned)_limiting_motor, (double)requested_gain, (double)_active_pressure_gain);
-
-		} else {
-			PX4_INFO("[CONTACT_PRESS] motor limit cleared");
-		}
-	}
-
-	_motor_output_limited = output_limited;
-
-	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
-		if (_press_output_mask & (1u << i)) {
-			const float pressure_target = _press_base_output[i] * scale;
-			motors.control[i] = _press_entry_output[i]
-					    + blend_progress * (pressure_target - _press_entry_output[i]);
-
-		} else {
-			motors.control[i] = NAN;
-		}
+		motors.control[i] = (_press_output_mask & (1u << i)) ? common_output : NAN;
 	}
 
 	_actuator_motors_pub.publish(motors);
 
-	if (pressure_ramp_start) {
+	if (takeover_start) {
 		publishStatus(true);
 		publishAsyncAck(vehicle_command_ack_s::VEHICLE_CMD_RESULT_ACCEPTED,
 				static_cast<uint8_t>(Result::ContactPressEntered), _active_request_id,
@@ -1111,8 +1079,8 @@ void CustomActionControl::publishControlSetpoint(hrt_abstime now)
 
 	if (contact_press) {
 		// Direct actuator mode disables the position, attitude, rate and control
-		// allocation pipeline. The active command blends monotonically into the
-		// aligned filtered trim, then multiplies it by the common pressure gain.
+		// allocation pipeline. All active motors share one output that reaches
+		// CUST_MOT_LIM in 300 ms; trim collection and matching are retained.
 		control_mode.direct_actuator = true;
 		_offboard_control_mode_pub.publish(control_mode);
 		publishDirectMotorSetpoint(now);
@@ -1158,9 +1126,19 @@ void CustomActionControl::publishStatus(bool force)
 	status.control_owner = _owner;
 	status.handover_id = _handover_id;
 	status.reason = _reason;
-	status.pressure_target_gain = math::max(_param_press_gain.get(), 0.f);
+	float common_start = 0.f;
+
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		if (_press_output_mask & (1u << i)) {
+			common_start = math::max(common_start, _press_entry_output[i]);
+		}
+	}
+
+	status.pressure_target_gain = common_start > FLT_EPSILON
+				      ? math::max(math::constrain(_param_motor_limit.get(), 0.5f, 1.f) / common_start - 1.f, 0.f)
+				      : 0.f;
 	status.pressure_applied_gain = _active_pressure_gain;
-	status.pressure_time_s = math::max(_param_press_time.get(), 0.2f);
+	status.pressure_time_s = static_cast<float>(kPressMotorBlendTime) * 1e-6f;
 	status.pressure_progress = 0.f;
 
 	if (_state == custom_action_status_s::STATE_CONTACT_PRESS && _pressure_ramp_started != 0
